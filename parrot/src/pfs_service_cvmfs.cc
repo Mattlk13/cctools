@@ -40,7 +40,7 @@ extern "C" {
 #include <string>
 #include <list>
 
-extern int pfs_master_timeout;
+extern int pfs_main_timeout;
 extern char pfs_temp_dir[];
 extern const char * pfs_cvmfs_repo_arg;
 extern const char * pfs_cvmfs_config_arg;
@@ -657,8 +657,8 @@ static cvmfs_filesystem *cvmfs_filesystem_create(const char *repo_name, bool wil
 			enable_alien_on_this_repository ? repo_name : "",
 			enable_alien_on_this_repository ? "," : "",
 
-			pfs_master_timeout,
-			pfs_master_timeout,
+			pfs_main_timeout,
+			pfs_main_timeout,
 			pfs_cvmfs_http_proxy ? ",proxies=" : "",
 			pfs_cvmfs_http_proxy ? pfs_cvmfs_http_proxy : "",
 			&f->subst_offset,
@@ -668,8 +668,8 @@ static cvmfs_filesystem *cvmfs_filesystem_create(const char *repo_name, bool wil
 			&repo_name_offset,
 			repo_name,
 
-			pfs_master_timeout,
-			pfs_master_timeout,
+			pfs_main_timeout,
+			pfs_main_timeout,
 			pfs_cvmfs_http_proxy ? ",proxies=" : "",
 			pfs_cvmfs_http_proxy ? pfs_cvmfs_http_proxy : "",
 			&f->subst_offset,
@@ -1177,7 +1177,7 @@ static bool path_expand_symlink(struct pfs_name *path, struct pfs_name *xpath)
 
 					strncat(xpath->rest, link_target, PFS_PATH_MAX);
 					path_collapse(xpath->rest, path_relative, 1);
-					snprintf(link_target, PFS_PATH_MAX, "/cvmfs/%s%s",
+					string_nformat(link_target, PFS_PATH_MAX, "/cvmfs/%s%s",
 						 xpath->host, path_relative);
 				}
 			}
@@ -1190,8 +1190,8 @@ static bool path_expand_symlink(struct pfs_name *path, struct pfs_name *xpath)
 				return false;
 			}
 
-			snprintf(xpath->rest, PFS_PATH_MAX, "%s%s", path_head, path_tail);
-			snprintf(xpath->path, PFS_PATH_MAX, "/cvmfs/%s%s", xpath->host, xpath->rest);
+			string_nformat(xpath->rest, PFS_PATH_MAX, "%s%s", path_head, path_tail);
+			string_nformat(xpath->path, PFS_PATH_MAX, "/cvmfs/%s%s", xpath->host, xpath->rest);
 			strcpy(xpath->logical_name, xpath->path);
 
 			debug(D_CVMFS, "expanding symlinks %s to %s\n", path->path, xpath->path);

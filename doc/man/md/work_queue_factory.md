@@ -33,16 +33,16 @@
 **work_queue_factory** submits and maintains a number
 of [work_queue_worker(1)](work_queue_worker.md) processes on various batch systems, such as
 Condor and SGE.  All the workers managed by a **work_queue_factory** process
-will be directed to work for a specific master, or any set of masters matching
+will be directed to work for a specific manager, or any set of managers matching
 a given project name.  **work_queue_factory** will automatically determine
 the correct number of workers to have running, based on criteria set on
 the command line.  The decision on how many workers to run is reconsidered
 once per minute.
 
 By default, **work_queue_factory** will run as many workers as the
-indicated masters have tasks ready to run.  If there are multiple
-masters, then enough workers will be started to satisfy their collective needs.
-For example, if there are two masters with the same project name, each with
+indicated managers have tasks ready to run.  If there are multiple
+managers, then enough workers will be started to satisfy their collective needs.
+For example, if there are two managers with the same project name, each with
 10 tasks to run, then **work_queue_factory** will start a total of 20 workers.
 
 If the number of needed workers increases, **work_queue_factory** will submit
@@ -55,10 +55,10 @@ for a certain time.)  A minimum number of workers will be maintained, given
 by the -w option.
 
 If given the -c option, then **work_queue_factory** will consider the capacity
-reported by each master.  The capacity is the estimated number of workers
-that the master thinks it can handle, based on the task execution and data
-transfer times currently observed at the master.  With the -c option on,
-**work_queue_factory** will consider the master's capacity to be the maximum
+reported by each manager.  The capacity is the estimated number of workers
+that the manager thinks it can handle, based on the task execution and data
+transfer times currently observed at the manager.  With the -c option on,
+**work_queue_factory** will consider the manager's capacity to be the maximum
 number of workers to run.
 
 If **work_queue_factory** receives a terminating signal, it will attempt to
@@ -66,47 +66,110 @@ remove all running workers before exiting.
 
 ## OPTIONS
 
-### Batch Options
+General options:
 
-- **-M --master-name <project>** Project name of masters to serve, can be a regular expression.
-- **-F --foremen-name <project>** Foremen to serve, can be a regular expression.
-- **--catalog catalog** Catalog server to query for masters (default: catalog.cse.nd.edu,backup-catalog.cse.nd.edu:9097).
-- **-T --batch-type <type>** Batch system type (required). One of: local, wq, condor, sge, torque, mesos, k8s, moab, slurm, chirp, amazon, lambda, dryrun, amazon-batch
-- **-B --batch-options <options>** Add these options to all batch submit files.
-- **-P --password <file>** Password file for workers to authenticate to master.
-- **-C --config-file <file>** Use the configuration file <file>.
-- **-w --min-workers <workers>** Minimum workers running.  (default=5)
-- **-W --max-workers <workers>** Maximum workers running.  (default=100)
-- **--workers-per-cycle workers** Maximum number of new workers per 30 seconds.  ( less than 1 disables limit, default=5)
-- **--tasks-per-worker workers** Average tasks per worker (default=one task per core).
-- **-t --timeout <time>** Workers abort after this amount of idle time (default=300).
-- **--env variable=value** Environment variable that should be added to the worker (May be specified multiple times).
-- **-E --extra-options <options>** Extra options that should be added to the worker.
-- **--cores n** Set the number of cores requested per worker.
-- **--gpus n** Set the number of GPUs requested per worker.
-- **--memory mb** Set the amount of memory (in MB) requested per worker.
-- **--disk mb** Set the amount of disk (in MB) requested per worker.
-- **--autosize** Automatically size a worker to an available slot (Condor, Mesos, and Kubernetes).
-- **--condor-requirements** Set requirements for the workers as Condor jobs. May be specified several times with expresions and-ed together (Condor only).
-- **--factory-timeout n** Exit after no master has been seen in <n> seconds.
-- **-S --scratch-dir <file>** Use this scratch dir for temporary files (default is /tmp/wq-pool-$uid).
-- **-c, --capacity** Use worker capacity reported by masters.
-- **-d --debug <subsystem>** Enable debugging for this subsystem.
-- **--amazon-config** Specify Amazon config file (for use with -T amazon).
-- **--wrapper** Wrap factory with this command prefix.
-- **--wrapper-input** Add this input file needed by the wrapper.
-- **--mesos-master hostname** Specify the host name to mesos master node (for use with -T mesos).
-- **--mesos-path filepath** Specify path to mesos python library (for use with -T mesos).
-- **--mesos-preload library** Specify the linking libraries for running mesos (for use with -T mesos).
-- **--k8s-image** Specify the container image for using Kubernetes (for use with -T k8s).
-- **--k8s-worker-image** Specify the container image that contains work_queue_worker availabe for using Kubernetes (for use with -T k8s).
-- **-o --debug-file <file>** Send debugging to this file (can also be :stderr, :stdout, :syslog, or :journal).
-- **-O --debug-file-size <mb>** Specify the size of the debug file (must use with -o option).
-- **--worker-binary file** Specify the binary to use for the worker (relative or hard path). It should accept the same arguments as the default work_queue_worker.
-- **--runos img** Will make a best attempt to ensure the worker will execute in the specified OS environment, regardless of the underlying OS.
-- **--run-factory-as-master** Force factory to run itself as a work queue master.
-- **-v, --version** Show the version string.
-- **-h, --help** Show this screen.
+
+- **-T** 
+ Batch system type (required). One of: local, wq, condor, sge, pbs, lsf, torque, moab, mpi, slurm, chirp, amazon, amazon-batch, lambda, mesos, k8s, dryrun
+- **-C** 
+ Use configuration file <file>.
+- **-M** 
+ Project name of managers to server, can be regex
+- **-F** 
+ Foremen to serve, can be a regular expression.
+- **--catalog=<host:port>** 
+ Catalog server to query for managers.
+- **-P** 
+ Password file for workers to authenticate.
+- **-S** 
+ Use this scratch dir for factory.
+- **(default:)
+ /tmp/wq-factory-$uid** .
+- **--run-factory-as-manager** 
+ Force factory to run itself as a manager.
+- **--parent-death** 
+ Exit if parent process dies.
+- **-d** 
+ Enable debugging for this subsystem.
+- **-o** 
+ Send debugging to this file.
+- **-O** 
+ Specify the size of the debug file.
+- **-v** 
+ Show the version string.
+- **-h** 
+ Show this screen.
+
+
+Concurrent control options:
+
+
+- **-w** 
+ Minimum workers running (default=5).
+- **-W** 
+ Maximum workers running (default=100).
+- **--workers-per-cycle** 
+ Max number of new workers per 30s (default=5)
+- **-t** 
+ Workers abort after idle time (default=300).
+- **--factory-timeout** 
+ Exit after no manager seen in <n> seconds.
+- **--tasks-per-worker** 
+ Average tasks per worker (default=one per core).
+- **-c** 
+ Use worker capacity reported by managers.
+
+
+Resource management options:
+
+- **--cores=<n>** 
+ Set the number of cores requested per worker.
+- **--gpus=<n>** 
+ Set the number of GPUs requested per worker.
+- **--memory=<mb>** 
+ Set the amount of memory (in MB) per worker.
+- **--disk=<mb>** 
+ Set the amount of disk (in MB) per worker.
+- **--autosize** 
+ Autosize worker to slot (Condor, Mesos, K8S).
+
+
+Worker environment options:
+
+- **--env=<variable=value>** 
+ Environment variable to add to worker.
+- **-E** 
+ Extra options to give to worker.
+- **--worker-binary=<file>** 
+ Alternate binary instead of work_queue_worker.
+- **--wrapper** 
+ Wrap factory with this command prefix.
+- **--wrapper-input** 
+ Add this input file needed by the wrapper.
+- **--runos=<img>** 
+ Use runos tool to create environment (ND only).
+- **--python-package** 
+ Run each worker inside this python package.
+
+
+Options  specific to batch systems:
+
+- **-B** 
+ Generic batch system options.
+- **--amazon-config** 
+ Specify Amazon config file.
+- **--condor-requirements** 
+ Set requirements for the workers as Condor jobs.
+- **--mesos-master** 
+ Host name of mesos manager node..
+- **--mesos-path** 
+ Path to mesos python library..
+- **--mesos-preload** 
+ Libraries for running mesos.
+- **--k8s-image** 
+ Container image for Kubernetes.
+- **--k8s-worker-image** 
+ Container image with worker for Kubernetes.
 
 
 ## EXIT STATUS
@@ -114,7 +177,7 @@ On success, returns zero. On failure, returns non-zero.
 
 ## EXAMPLES
 
-Suppose you have a Work Queue master with a project name of "barney".
+Suppose you have a Work Queue manager with a project name of "barney".
 To maintain workers for barney, do this:
 
 ```
@@ -159,7 +222,7 @@ work_queue_factory -Cmy_conf
 **my_conf** should be a proper JSON document, as:
 ```
 {
-        "master-name": "my_master.*",
+        "manager-name": "my_manager.*",
         "max-workers": 100,
         "min-workers": 0
 }
@@ -168,7 +231,7 @@ work_queue_factory -Cmy_conf
 Valid configuration fields are:
 
 ```
-master-name
+manager-name
 foremen-name
 min-workers
 max-workers

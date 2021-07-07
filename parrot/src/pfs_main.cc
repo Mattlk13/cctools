@@ -85,7 +85,7 @@ int linux_micro;
 
 int wait_barrier = 0;
 
-int pfs_master_timeout = 300;
+int pfs_main_timeout = 300;
 struct file_cache *pfs_file_cache = 0;
 struct password_cache *pfs_password_cache = 0;
 struct hash_table *available_services;
@@ -249,7 +249,7 @@ static void show_help( const char *cmd )
 	printf( " %-30s Maximum amount of time to retry failures.    (PARROT_TIMEOUT)\n", "-T,--timeout=<time>");
 	printf( " %-30s Enable debugging for this sub-system.    (PARROT_DEBUG_FLAGS)\n", "-d,--debug=<name>");
 	printf( " %-30s Send debugging to this file.              (PARROT_DEBUG_FILE)\n", "-o,--debug-file=<file>");
-	printf( " %-30s     (can also be :stderr, :stdout, :syslog, or :journal)\n", "");
+	printf( " %-30s     (can also be :stderr, or :stdout)\n", "");
 	printf( " %-30s Rotate debug files of this size.     (PARROT_DEBUG_FILE_SIZE)\n", "-O,--debug-rotate-max=<bytes>");
 	printf( " %-30s     (default 10M, 0 disables)\n","");
 	printf( " %-30s Display version number.\n", "-v,--version");
@@ -658,7 +658,7 @@ int main( int argc, char *argv[] )
 	install_handler(SIGTTOU,SIG_IGN);
 
 	if(!isatty(0)) {
-		pfs_master_timeout = 3600;
+		pfs_main_timeout = 3600;
 	}
 
 	pfs_uid = getuid();
@@ -736,7 +736,7 @@ int main( int argc, char *argv[] )
 	if(s) pfs_gid = atoi(s);
 
 	s = getenv("PARROT_TIMEOUT");
-	if(s) pfs_master_timeout = string_time_parse(s);
+	if(s) pfs_main_timeout = string_time_parse(s);
 
 	s = getenv("PARROT_FORCE_SYNC");
 	if(s) pfs_force_sync = 1;
@@ -1040,7 +1040,7 @@ int main( int argc, char *argv[] )
 			snprintf(pfs_temp_dir,sizeof(pfs_temp_dir),"%s",optarg);
 			break;
 		case 'T':
-			pfs_master_timeout = string_time_parse(optarg);
+			pfs_main_timeout = string_time_parse(optarg);
 			break;
 		case 'U':
 			pfs_uid = atoi(optarg);
@@ -1159,7 +1159,7 @@ int main( int argc, char *argv[] )
 
 	if(optind>=argc) show_help(argv[0]);
 
-	FILE *stats_out;
+	FILE *stats_out = NULL;
 	if (stats_file) {
 		stats_enable();
 		stats_out = fopen(stats_file, "w");
@@ -1367,6 +1367,10 @@ int main( int argc, char *argv[] )
 				" - The program that launched Parrot used `PR_SET_DUMPABLE` to disable debugging\n   for this process.\n"
 				" - Your system's security framework (SELinux, Yama, etc.) disables ptrace.\n");
 		}
+
+		/* Manually kill first children as it is never added to the processes table if the attach operation fails. */
+		kill(pid, SIGKILL);
+
 		fatal("could not trace child");
 	}
 	kill(pid, SIGUSR1);

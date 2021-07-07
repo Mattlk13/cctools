@@ -6,6 +6,7 @@ See the file COPYING for details.
 
 #include "batch_job.h"
 #include "batch_job_internal.h"
+#include "buffer.h"
 #include "debug.h"
 #include "path.h"
 #include "stringtools.h"
@@ -13,6 +14,7 @@ See the file COPYING for details.
 #include "xxmalloc.h"
 #include "jx.h"
 #include "jx_match.h"
+#include "macros.h"
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -30,6 +32,11 @@ static char * cluster_options = NULL;
 static char * cluster_jobname_var = NULL;
 
 int batch_job_verbose_jobnames = 0;
+int batch_job_disable_heartbeat = 0;
+
+static int heartbeat_rate =  30;	//in seconds. rate at which hearbeats are written to the log.
+static int heartbeat_max  = 120;	//in seconds. maximum wait for a heartbeat before gibing up on the job.
+
 
 /*
 Principle of operation:
@@ -59,8 +66,6 @@ static int setup_batch_wrapper(struct batch_queue *q, const char *sysname )
 	char wrapperfile[PATH_MAX];
 	snprintf(wrapperfile, PATH_MAX, "%s.wrapper", sysname);
 
-	if(access(wrapperfile, R_OK | X_OK) == 0) return 1;
-
 	FILE *file = fopen(wrapperfile, "w");
 	if(!file) {
 		return 0;
@@ -75,30 +80,38 @@ static int setup_batch_wrapper(struct batch_queue *q, const char *sysname )
 
 	if(q->type == BATCH_QUEUE_TYPE_SLURM){
 		fprintf(file, "[ -n \"${SLURM_JOB_ID}\" ] && JOB_ID=`echo ${SLURM_JOB_ID} | cut -d . -f 1`\n");
+	} else if(q->type == BATCH_QUEUE_TYPE_LSF) {
+		fprintf(file, "[ -n \"${LSB_JOBID}\" ] && JOB_ID=`echo ${LSB_JOBID} | cut -d . -f 1`\n");
 	} else {
-		// Some systems set PBS_JOBID, some set JOBID.
 		fprintf(file, "[ -n \"${PBS_JOBID}\" ] && JOB_ID=`echo ${PBS_JOBID} | cut -d . -f 1`\n");
 	}
 
-	if(q->type == BATCH_QUEUE_TYPE_TORQUE || q->type == BATCH_QUEUE_TYPE_PBS){
+	if(q->type == BATCH_QUEUE_TYPE_TORQUE || q->type == BATCH_QUEUE_TYPE_PBS || q->type==BATCH_QUEUE_TYPE_LSF) {
 		fprintf(file, "cd %s\n", path);
 	}
 
 	// Each job writes out to its own log file.
 	fprintf(file, "logfile=%s.status.${JOB_ID}\n", sysname);
 	fprintf(file, "starttime=`date +%%s`\n");
-	fprintf(file, "cat > $logfile <<EOF\n");
-	fprintf(file, "start $starttime\n");
-	fprintf(file, "EOF\n\n");
+	fprintf(file, "echo start $starttime > $logfile\n");
+
+	if(!batch_job_disable_heartbeat) {
+		// Write a heartbeat to the log file, in case the batch system removes the job from under us.
+		fprintf(file, "(while true; do sleep %d; echo alive $(date +%%s) >> $logfile; done) &\n", heartbeat_rate);
+		fprintf(file, "pid_heartbeat=$!\n");
+	}
+
 	// The command to run is taken from the environment.
 	fprintf(file, "eval \"$BATCH_JOB_COMMAND\"\n\n");
 
 	// When done, write the status and time to the logfile.
 	fprintf(file, "status=$?\n");
+	if(!batch_job_disable_heartbeat) {
+		fprintf(file, "kill $pid_heartbeat\n");
+	}
 	fprintf(file, "stoptime=`date +%%s`\n");
-	fprintf(file, "cat >> $logfile <<EOF\n");
-	fprintf(file, "stop $status $stoptime\n");
-	fprintf(file, "EOF\n");
+	fprintf(file, "echo stop $status $stoptime >> $logfile\n");
+	fprintf(file, "exit 0\n");
 	fclose(file);
 
 	return 1;
@@ -106,49 +119,85 @@ static int setup_batch_wrapper(struct batch_queue *q, const char *sysname )
 
 static char *cluster_set_resource_string(struct batch_queue *q, const struct rmsummary *resources)
 {
-	char *cluster_resources = NULL;
-	const char *ignore_mem = hash_table_lookup(q->options, "ignore-mem-spec");
-	const char *mem_type = hash_table_lookup(q->options, "mem-type");
+	if(batch_queue_option_is_yes(q, "safe-submit-mode")) {
+		return xxstrdup("");
+	}
+
+	int ignore_mem  = batch_queue_option_is_yes(q, "ignore-mem-spec");
+	int ignore_disk = batch_queue_option_is_yes(q, "ignore-disk-spec");
+	int ignore_time = batch_queue_option_is_yes(q, "ignore-time-spec");
+	int ignore_core = batch_queue_option_is_yes(q, "ignore-core-spec");
+
+	buffer_t cluster_resources;
+	buffer_init(&cluster_resources);
 
 	if(q->type == BATCH_QUEUE_TYPE_TORQUE || q->type == BATCH_QUEUE_TYPE_PBS){
-		char *mem = string_format(",mem=%" PRId64 "mb", resources->memory);
-		char *disk = string_format(",file=%" PRId64 "mb", resources->disk);
-		cluster_resources = string_format(" -l nodes=1:ppn=%" PRId64 "%s%s ", 
-			resources->cores>0 ? resources->cores : 1,
-			resources->memory>0 ? mem : "",
-			resources->disk>0 ? disk  : "");
-		free(mem);
-		free(disk);
-	} else if(q->type == BATCH_QUEUE_TYPE_SLURM){
-		char *mem = NULL;
-		if(!strcmp("no", ignore_mem)){
-			mem = string_format(" --mem=%" PRId64 "M", resources->memory);
+		buffer_printf(&cluster_resources, " -l nodes=1:ppn=%.0f", MAX(1, DIV_INT_ROUND_UP(resources->cores, 1)));
+		if(!ignore_mem && resources->memory > 0) {
+			buffer_printf(&cluster_resources, ",mem=%.0f mb", DIV_INT_ROUND_UP(resources->memory, 1));
 		}
-		// Currently leaving out tmp as SLURM assumes a shared FS and tmp may be limiting
-		// char *disk = string_format(" --tmp=%" PRId64 "M", resources->disk);
-		cluster_resources = string_format(" -N 1 -n 1 -c %" PRId64 "%s ", 
-			resources->cores>0 ? resources->cores : 1,
-			(resources->memory>0 && mem) ? mem : "");
-		free(mem);
-	} else if(q->type == BATCH_QUEUE_TYPE_SGE){
-		char *mem = NULL;
-		mem = string_format(" -l %s=%" PRId64 "M", (mem_type ? mem_type : "h_vmem"), resources->memory);
-		// SGE assumes shared FS, ignoring possible disk specification
-		cluster_resources = string_format(" -pe smp %" PRId64 "%s ", 
-			resources->cores>0 ? resources->cores : 1,
-			(resources->memory>0 && mem) ? mem : "");
-		free(mem);
+		if(!ignore_disk && resources->disk > 0) {
+			buffer_printf(&cluster_resources, ",file=%.0f mb", DIV_INT_ROUND_UP(resources->disk, 1));
+		}
+	} else if(q->type == BATCH_QUEUE_TYPE_SLURM){
+		if(!ignore_mem && resources->memory > 0) {
+			buffer_printf(&cluster_resources, " --mem=%.0f M", DIV_INT_ROUND_UP(resources->memory, 1));
+		}
+		if(!ignore_time && resources->wall_time > 0) {
+			// expected in minutes, not seconds
+			buffer_printf(&cluster_resources, " --time=%.0f", DIV_INT_ROUND_UP(resources->wall_time, 60));
+		}
 
+		/* The value of max_concurrent_processes is set by the .MAKEFLOW MPI_PROCESSES.
+		 * If set, the number of cores should be divisible by max_concurrent_processes. */
+		int procs = resources->max_concurrent_processes > 0 ? (int) DIV_INT_ROUND_UP(resources->max_concurrent_processes, 1) : 1;
+		int cores = resources->cores > 0 ? (int) DIV_INT_ROUND_UP(resources->cores, 1) : 1;
+
+		if(procs > 1) {
+			cores = cores / procs;
+			//It is an error if cores cannot be equally distributes to all (mpi) processes
+			if(cores * procs != resources->cores) {
+				fatal("The number of MPI processes (%d) does not eqully divide the number of cores (%d).", procs, resources->cores);
+			}
+		}
+
+		buffer_printf(&cluster_resources, " -N 1 -n %d -c %d", procs, cores);
+	} else if(q->type == BATCH_QUEUE_TYPE_SGE){
+		if(!ignore_mem && resources->memory > 0) {
+			const char *mem_type = batch_queue_get_option(q, "mem-type");
+			buffer_printf(&cluster_resources, " -l %s=%.0f M", mem_type ? mem_type : "h_vmem", resources->memory);
+		}
+		if(!ignore_time && resources->wall_time > 0) {
+			buffer_printf(&cluster_resources, " -l h_rt=00:%.0f:00", DIV_INT_ROUND_UP(resources->wall_time, 60));
+		}
+
+		buffer_printf(&cluster_resources, " -pe smp %0.f", resources->cores > 0 ? DIV_INT_ROUND_UP(resources->cores, 1) : 1);
+	} else if(q->type==BATCH_QUEUE_TYPE_LSF) {
+		if(!ignore_mem && resources->memory>0) {
+			// resources->memory is in units of MB
+			buffer_printf(&cluster_resources,"-M %.0fMB",resources->memory);
+		}
+
+		if(!ignore_core && resources->cores>0) {
+			// -n Gives the number of "tasks" in a job.
+			// Can be specified as a range: -n 4,8 indicates flexibility of 4 to 8 tasks.
+			// Not yet clear yet if this meaning differs for multi-thread versus MPI applications.
+			buffer_printf(&cluster_resources,"-n %.0f", DIV_INT_ROUND_UP(resources->cores, 1));
+		}
+
+		if(!ignore_time && resources->wall_time > 0 ) {
+			// -W puts a hard limit on run time.
+			// -We gives an estimated time for scheduling puporses.
+			// Both use minutes as the units.
+			buffer_printf(&cluster_resources,"-We %.0f", DIV_INT_ROUND_UP(resources->wall_time, 60));
+		}
 	}
-	const char *safe_mode = hash_table_lookup(q->options, "safe-submit-mode");
-	if(safe_mode && !strcmp("yes", safe_mode)) {
-		free(cluster_resources);
-		cluster_resources = NULL;
-	}
-	if(!cluster_resources) {
-		cluster_resources = xxstrdup("");
-	}
-	return cluster_resources;
+
+	buffer_printf(&cluster_resources, " ");
+	char *resources_str = xxstrdup(buffer_tostring(&cluster_resources));
+	buffer_free(&cluster_resources);
+
+	return resources_str;
 }
 
 static batch_job_id_t batch_job_cluster_submit (struct batch_queue * q, const char *cmd, const char *extra_input_files, const char *extra_output_files, struct jx *envlist, const struct rmsummary *resources )
@@ -219,7 +268,12 @@ static batch_job_id_t batch_job_cluster_submit (struct batch_queue * q, const ch
 	}
 	submit_id++;
 
-	char *command = string_format("%s %s %s %s %s %s %s.wrapper",
+	/*
+	Note that dot-slash is needed in front of the wrapper command
+	b/c some batch systems perform a PATH search on the executable.
+	*/
+
+	char *command = string_format("%s %s %s %s %s %s ./%s.wrapper",
 		cluster_submit_cmd,
 		cluster_resources,
 		cluster_options,
@@ -243,6 +297,7 @@ static batch_job_id_t batch_job_cluster_submit (struct batch_queue * q, const ch
 	while(fgets(line, sizeof(line), file)) {
 		if(sscanf(line, "Your job %" SCNbjid, &jobid) == 1
 		|| sscanf(line, "Submitted batch job %" SCNbjid, &jobid) == 1
+		|| sscanf(line, "Job <%" SCNbjid "> is submitted", &jobid) == 1
 		|| sscanf(line, "%" SCNbjid, &jobid) == 1 ) {
 			debug(D_BATCH, "job %" PRIbjid " submitted", jobid);
 			pclose(file);
@@ -277,10 +332,15 @@ static batch_job_id_t batch_job_cluster_wait (struct batch_queue * q, struct bat
 			char *statusfile = string_format("%s.status.%" PRIbjid, cluster_name, jobid);
 			FILE *file = fopen(statusfile, "r");
 			if(file) {
+				fseek(file, info->log_pos, SEEK_SET);
 				char line[BATCH_JOB_LINE_MAX];
 				while(fgets(line, sizeof(line), file)) {
 					if(sscanf(line, "start %d", &t)) {
 						info->started = t;
+						if(!info->heartbeat)
+							info->heartbeat = t;
+					} else if(sscanf(line, "alive %d", &t)) {
+						info->heartbeat = t;
 					} else if(sscanf(line, "stop %d %d", &c, &t) == 2) {
 						debug(D_BATCH, "job %" PRIbjid " complete", jobid);
 						if(!info->started)
@@ -290,7 +350,17 @@ static batch_job_id_t batch_job_cluster_wait (struct batch_queue * q, struct bat
 						info->exit_code = c;
 					}
 				}
+				info->log_pos = ftell(file);
 				fclose(file);
+
+				if(!batch_job_disable_heartbeat && (time(0) - info->heartbeat > heartbeat_max)) {
+						warn(D_BATCH, "job %" PRIbjid " does not appear to be running anymore.", jobid);
+						if(!info->started)
+							info->started = info->heartbeat;
+						info->finished = info->heartbeat;
+						info->exited_normally = 0;
+						info->exit_signal = 1;  //same used as batch_job_cluster_remove
+				}
 
 				if(info->finished != 0) {
 					unlink(statusfile);
@@ -380,6 +450,13 @@ static int batch_queue_cluster_create (struct batch_queue *q)
 			cluster_remove_cmd = strdup("qdel");
 			cluster_options = strdup("-o /dev/null -j oe -V");
 			cluster_jobname_var = strdup("-N");
+			break;
+		case BATCH_QUEUE_TYPE_LSF:
+			cluster_name = strdup("lsf");
+			cluster_submit_cmd = strdup("bsub");
+			cluster_remove_cmd = strdup("bkill");
+			cluster_options = strdup("-o /dev/null -e /dev/null -env all");
+			cluster_jobname_var = strdup("-J");
 			break;
 		case BATCH_QUEUE_TYPE_TORQUE:
 			cluster_name = strdup("torque");
@@ -517,6 +594,32 @@ const struct batch_queue_module batch_queue_sge = {
 const struct batch_queue_module batch_queue_pbs = {
 	BATCH_QUEUE_TYPE_PBS,
 	"pbs",
+
+	batch_queue_cluster_create,
+	batch_queue_cluster_free,
+	batch_queue_cluster_port,
+	batch_queue_cluster_option_update,
+
+	{
+		batch_job_cluster_submit,
+		batch_job_cluster_wait,
+		batch_job_cluster_remove,
+	},
+
+	{
+		batch_fs_cluster_chdir,
+		batch_fs_cluster_getcwd,
+		batch_fs_cluster_mkdir,
+		batch_fs_cluster_putfile,
+		batch_fs_cluster_rename,
+		batch_fs_cluster_stat,
+		batch_fs_cluster_unlink,
+	},
+};
+
+const struct batch_queue_module batch_queue_lsf = {
+	BATCH_QUEUE_TYPE_LSF,
+	"lsf",
 
 	batch_queue_cluster_create,
 	batch_queue_cluster_free,

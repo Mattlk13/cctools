@@ -24,7 +24,7 @@ geography, and high energy physics all use Makeflow to compose workflows from
 existing applications.
 
 Makeflow can send your jobs to a wide variety of services, such as batch
-systems (HTCondor, SGE, PBS, Torque), cluster managers (Mesos and Kubernetes),
+systems (HTCondor, SGE, PBS, LSF, Torque), cluster managers (Mesos and Kubernetes),
 cloud services (Amazon EC2 or Lambda) and container environments like Docker
 and Singularity. Details for each of those systems are given in the Batch
 System Support section.
@@ -122,6 +122,9 @@ To learn more about the various batch system options, see the Batch System
 Support section.
 
 
+!!! warning
+    You may have to slightly adapt the makeflow workflow file to work across different batch systems. This is because different batch systems have different expectations on whether the underlying filesystem is shared (e.g., slurm and torque), or not (e.g., condor and work queue). 
+
 ### JX Language
 
 The classic make language is easy to learn and suitable for many purposes, but
@@ -151,8 +154,9 @@ Learn more about JX [here](../jx).
 
 Most batch systems require information about what resources each job needs, so
 as to schedule them appropriately. You can convey this by setting the
-variables CORES, MEMORY (in MB), and DISK (in MB) ahead of each job. Makeflow
-will translate this information as needed to the underlying batch system. For
+variables CORES, MEMORY (in MB), and DISK (in MB), ahead
+of each job. Makeflow will translate this information as needed to the
+underlying batch system. For
 example:
 
 ```make
@@ -235,6 +239,16 @@ Makeflow supports a wide variety of batch systems. Use `makeflow --help` to
 see the current list supported. Generally speaking, simply run Makeflow with
 the `-T` option to select your desired batch system. If no option is given,
 then `-T local` is assumed.
+
+
+!!! warning
+    As mentioned before, different batch systems have different expectations on
+    whether the underlying filesystem is shared. For example, one workflow may
+    work with `-Tslurm`, but may fail with `-Tcondor`, etc. The most portable
+    workflows read and write files from the working directory of each rule. If
+    a rule depends on the creation of a directory, make this creation explicit,
+    as the directory may not be present for the intermidate results on the site
+    where the rule executes.
 
 If you need to pass additional parameters to your batch system, such as
 specifying a specific queue or machine category, use the `-B` option to
@@ -331,14 +345,30 @@ added onto `qsub` in this format:
 To remove resources specification at submission use the Makeflow option `--safe-submit-mode`.
 
 
+### LSF - Load Sharing Facility
+
+Use the `-T lsf` option to submit jobs to the [Load Sharing Facility](https://www.ibm.com/support/knowledgecenter/SSETD4/product_welcome_platform_lsf.html),
+known previously as "Platform LSF" and now "IBM Spectrum LSF".
+
+As above, Makeflow will automatically generate `bsub` commands to submit jobs.
+For example, to submit a job requiring 4 cores, 64MB of memory, and an expected
+runtime of 120 minutes, Makeflow will generate a command line like this:
+
+```sh
+bsub -J makeflow23 -n 4 -M 64MB -We 120 job.sh
+```
+
+If you have additional options peculiar to your local facility, use the `-B` option
+to makeflow or the `BATCH_OPTIONS` variable to specify additional submission options.
+
 ### Torque Batch System
 
 Use the `-T torque` option to submit jobs to the [Torque Resource
 Manager](http://www.adaptivecomputing.com/products/open-source/torque) batch
 system.
 
-This will add the values for cores, memory, and disk. These values will be
-added onto `qsub` in this format:  
+This will any of the values for cores, memory, disk, and wall-time defined.
+These values will be added onto `qsub` in this format:  
 
 ```make
 -l nodes=1:ppn=${CORES},mem=${MEMORY}mb,file=${DISK}mb
@@ -356,8 +386,12 @@ This will add the values for cores and memory. These values will be added onto
 `sbatch` in this format:  
 
 ```sh
--N 1 -n ${CORES} --mem=${MEMORY}M
+-N 1 -n 1 -c ${CORES} --mem=${MEMORY}M --time=${WALL_TIME_in_minutes}
 ```
+
+Note that slurm expects this time to be in minutes, while makeflow expects
+WALL_TIME to be in seconds. You should specify `.MAKEFLOW WALL_TIME` in seconds, and
+makeflow will round-up this value to minutes when submiting the job.
 
 To remove resources specification at submission use Makeflow option `--safe-submit-mode`.
 
@@ -369,6 +403,46 @@ highly dependent on host site.
 Note: Some SLURM sites disallow specifying memory (example Stampede2). To
 avoid specification errors the Makeflow option `--ignore-memory-spec` removes
 memory from `sbatch`.
+
+
+#### SLURM and MPI jobs
+
+If your rules should run as an MPI jobs, you can set the environment variables
+"MPI_PROCESSES" and "CORES", or alternatively, use the makeflow directives
+".MAKEFLOW MPI_PROCESSES" and ".MAKEFLOW CORES". The value of MPI_PROCESSES
+sets the number of MPI processes the rule should spawn, and it should exactly
+divide the value of CORES. The value of sbatch used is something similar to:
+
+```sh
+-N 1 -n ${MPI_PROCESSES} -c ${CORES_divided_by_MPI_PROCESSES} --mem=${MEMORY}M
+```
+
+Further, the commands in your rules should be prepended with the `srun` command
+appropiate to your prefered MPI API, for example, here is a rule that uses 4
+MPI process, with 2 CORES each, using the `pmi2` API:
+
+```make
+.MAKEFLOW MPI_PROCESSES 4
+.MAKEFLOW CORES 8
+
+output: input
+    srun --mpi=pmi2 -- ./my-mpi-job -i input -o output
+```
+
+Some installations may require a queue and time limit specifications. Since
+both `sbatch` (used internally by makeflow), and `srun` require these options,
+the environment variable can be used in the following way:
+
+```make
+# Setting queue and time limit needed as in xsede stampede2:
+BATCH_OPTIONS=-pnormal -t900
+.MAKEFLOW MPI_PROCESSES 4
+.MAKEFLOW CORES 8
+
+output: input
+    srun $(BATCH_OPTIONS) --mpi=pmi2 -- ./my-mpi-job -i input -o output
+```
+
 
 ### Moab Scheduler
 
@@ -424,7 +498,7 @@ mpirun -np $NSLOTS makeflow -T mpi example.makeflow
 
 Makeflow can be used with Apache Mesos. To run Makeflow with Mesos, give the
 batch mode via `-T mesos` and pass the hostname and port number of Mesos
-master to Makeflow with the `--mesos-master` option. Since the Makeflow-Mesos
+manager to Makeflow with the `--mesos-master` option. Since the Makeflow-Mesos
 Scheduler is based on Mesos Python2 API, the path to Mesos Python2 library
 should be included in the `$PATH`, or one can specify a preferred Mesos
 Python2 API via ` --mesos-path ` option. To successfully import the Python
@@ -432,7 +506,7 @@ library, you may need to indicate dependencies through `--mesos-preload `
 option.
 
 For example, here is the command to run Makeflow on a Mesos cluster that has
-the master listening on port 5050 of localhost, with a user specified python
+the manager listening on port 5050 of localhost, with a user specified python
 library:
 
 ```sh
@@ -645,7 +719,7 @@ options or other details. Please refer to [Work Queue manual ](../work_queue) fo
 Makeflow listens on a port which the remote workers would connect to. The
 default port number is 9123. Sometimes, however, the port number might be not
 available on your system. You can change the default port via the `-p` option.
-For example, if you want the master to listen on port 9567 by default, you can
+For example, if you want the manager to listen on port 9567 by default, you can
 run the following command:
 
 ```sh
@@ -655,19 +729,19 @@ $ makeflow -T wq -p 9567 example.makeflow
 ### Project Names
 
 If you do not like using port numbers, an easier way to match workers to
-masters is to use a project name. You can give each master a project name with
+managers is to use a project name. You can give each manager a project name with
 the -N option.
 
 ```sh
 $ makeflow -T wq -N MyProject example.makeflow
 ```
 
-The -N option gives the master a project name called `MyProject`, and will
+The -N option gives the manager a project name called `MyProject`, and will
 cause it to advertise its information such as the project name, running status,
 hostname and port number, to a default globally available catalog server. Then
 a worker can simply identify the workload by its project name.
 
-To start a worker that automatically finds the master named __MyProject__ via the default
+To start a worker that automatically finds the manager named __MyProject__ via the default
 catalog server:
 
 ```sh
@@ -677,8 +751,8 @@ $ work_queue_worker -N MyProject
 You can also give multiple `-N` options to a worker. The worker will find out
 which ones of the specified projects are running from the catalog server and
 randomly select one to work for. When one project is done, the worker would
-repeat this process. Thus, the worker can work for a different master without
-being stopped and given the different hostname and port of the master. An example
+repeat this process. Thus, the worker can work for a different manager without
+being stopped and given the different hostname and port of the manager. An example
 of specifying multiple projects:
 
 ```sh

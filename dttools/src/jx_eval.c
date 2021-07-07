@@ -186,45 +186,10 @@ static struct jx *jx_eval_array(struct jx_operator *op, struct jx *left, struct 
 static struct jx *jx_eval_call(struct jx *func, struct jx *args, struct jx *ctx) {
 	assert(func);
 	assert(args);
-	assert(args->type == JX_ARRAY);
+	assert(jx_istype(args, JX_ARRAY));
+	assert(jx_istype(func, JX_SYMBOL));
 
-	if (!jx_istype(func, JX_SYMBOL)) {
-		jx_error(jx_format(
-			"on line %d, unknown function: %s",
-			func->line,
-			func->u.symbol_name
-		));
-	}
-
-	if (!strcmp(func->u.symbol_name, "range")) {
-		return jx_function_range(args);
-	} else if (!strcmp(func->u.symbol_name, "format")) {
-		return jx_function_format(args);
-	} else if (!strcmp(func->u.symbol_name, "join")) {
-		return jx_function_join(args);
-	} else if (!strcmp(func->u.symbol_name, "ceil")) {
-		return jx_function_ceil(args);
-	} else if (!strcmp(func->u.symbol_name, "floor")) {
-		return jx_function_floor(args);
-	} else if (!strcmp(func->u.symbol_name, "basename")) {
-		return jx_function_basename(args);
-	} else if (!strcmp(func->u.symbol_name, "dirname")) {
-		return jx_function_dirname(args);
-	} else if (!strcmp(func->u.symbol_name, "listdir")) {
-		return jx_function_listdir(args);
-	} else if (!strcmp(func->u.symbol_name, "escape")) {
-		return jx_function_escape(args);
-	} else if (!strcmp(func->u.symbol_name, "template")) {
-		return jx_function_template(args, ctx);
-	} else if (!strcmp(func->u.symbol_name, "len")) {
-		return jx_function_len(args);
-	} else {
-		return jx_error(jx_format(
-			"on line %d, unknown function: %s",
-			func->line,
-			func->u.symbol_name
-		));
-	}
+    return jx_function_eval(func->u.symbol_name, args, ctx);
 }
 
 static struct jx *jx_eval_slice(struct jx *array, struct jx *slice) {
@@ -333,19 +298,18 @@ static struct jx * jx_eval_operator( struct jx_operator *o, struct jx *context )
 	struct jx *right = NULL;
 	struct jx *result = NULL;
 
-	right = jx_eval(o->right,context);
-	if (jx_istype(right, JX_ERROR)) {
-		result = right;
-		right = NULL;
-		goto DONE;
-	}
-
-	if (o->type == JX_OP_CALL) return jx_eval_call(o->left, right, context);
+	if (o->type == JX_OP_CALL) return jx_eval_call(o->left, o->right, context);
 
 	left = jx_eval(o->left,context);
 	if (jx_istype(left, JX_ERROR)) {
 		result = left;
 		left = NULL;
+		goto DONE;
+	}
+	right = jx_eval(o->right,context);
+	if (jx_istype(right, JX_ERROR)) {
+		result = right;
+		right = NULL;
 		goto DONE;
 	}
 
@@ -434,6 +398,7 @@ static struct jx_item *jx_eval_comprehension(struct jx *body, struct jx_comprehe
 	struct jx *list = jx_eval(comp->elements, context);
 	if (jx_istype(list, JX_ERROR)) return jx_item(list, NULL);
 	if (!jx_istype(list, JX_ARRAY)) {
+		jx_delete(list);
 		return jx_item(jx_error(jx_format(
 			"on line %d: list comprehension takes an array",
 			comp->line
@@ -613,10 +578,21 @@ struct jx * jx_eval( struct jx *j, struct jx *context )
 
 struct jx * jx_eval_with_defines( struct jx *j, struct jx *context )
 {
+    int free_defines = 0;
+    int free_context = 0;
+
 	// Find the define clause in j, if it exists.
 	struct jx *defines = jx_lookup(j,"define");
-	if(!defines) defines = jx_object(0);
-	if(!context) context = jx_object(0);
+
+	if(!defines) {
+        free_defines = 1;
+        defines = jx_object(0);
+    }
+
+	if(!context) {
+        free_context = 1;
+        context = jx_object(0);
+    }
 
 	// Merge the context and defines into mcontext.
 	struct jx *mcontext = jx_merge(defines,context,0);
@@ -625,6 +601,14 @@ struct jx * jx_eval_with_defines( struct jx *j, struct jx *context )
 	struct jx * result = jx_eval(j,mcontext);
 
 	jx_delete(mcontext);
+
+    if(free_defines) {
+        jx_delete(defines);
+    }
+
+    if(free_context) {
+        jx_delete(context);
+    }
 	return result;
 }
 

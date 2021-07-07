@@ -58,6 +58,7 @@ link_close(link);
 
 /** Stoptime to give when you wish to wait forever */
 #define LINK_FOREVER ((time_t)INT_MAX)
+#define LINK_NOWAIT ((time_t)INT_MIN)
 
 /** Connect to a remote host.
 @param addr IP address of server in string form.
@@ -114,11 +115,11 @@ Functions like @ref link_serve, except that the server will only be visible on t
 struct link *link_serve_addrrange(const char *addr, int low, int high);
 
 /** Accept one connection.
-@param master A link returned from @ref link_serve or @ref link_serve_address.
+@param parent A link returned from @ref link_serve or @ref link_serve_address.
 @param stoptime The time at which to abort.
 @return link A connection to a client, or null on failure.
 */
-struct link *link_accept(struct link *master, time_t stoptime);
+struct link *link_accept(struct link *parent, time_t stoptime);
 
 /** Read data from a connection.
 This call will block until the given number of bytes have been read,
@@ -345,5 +346,7 @@ Wait for a activity on a an array of links.
 */
 
 int link_poll(struct link_info *array, int nlinks, int msec);
+
+int errno_is_temporary(int e);
 
 #endif

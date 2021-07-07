@@ -167,9 +167,38 @@ struct dag_variable_value *dag_variable_get_value(const char *name, struct hash_
 	return var->values[index];
 }
 
+int dag_variable_count(const char *name, struct dag_variable_lookup_set *s )
+{
+	if(!s) {
+		return 0;
+	}
+
+	struct hash_table *t = NULL;
+	/* Try node variables table */
+	if(s->node) {
+		t = s->node->variables;
+	} else if(!s->dag) {
+		t = NULL;
+	} else if(!s->category) {
+		t = s->dag->default_category->mf_variables;
+	} else if(s->category) {
+		t = s->category->mf_variables;
+	}
+
+	if(t) {
+		struct dag_variable *var = hash_table_lookup(t, name);
+		if(var) {
+			return var->count;
+		}
+	}
+
+	return 0;
+}
+
+
 struct dag_variable_value *dag_variable_lookup(const char *name, struct dag_variable_lookup_set *s )
 {
-	struct dag_variable_value *v;
+	struct dag_variable_value *v = NULL;
 
 	if(!s)
 		return NULL;
@@ -208,10 +237,12 @@ struct dag_variable_value *dag_variable_lookup(const char *name, struct dag_vari
 		return v;
 	}
 
-	/* Try the environment last. */
-	char *value = getenv(name);
+	/* Try the environment last. If found, add it to the default dag variables table.*/
+	const char *value = getenv(name);
 	if(value) {
-		return dag_variable_value_create(value);
+		s->table = s->dag->default_category->mf_variables;
+		dag_variable_add_value(name, s->table, 0, value);
+		return dag_variable_lookup(name, s);
 	}
 
 	return NULL;

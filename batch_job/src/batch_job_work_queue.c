@@ -63,7 +63,7 @@ static void specify_envlist( struct work_queue_task *t, struct jx *envlist )
 	if(envlist) {
 		struct jx_pair *p;
 		for(p=envlist->u.pairs;p;p=p->next) {
-			work_queue_task_specify_enviroment_variable(t,p->key->u.string_value,p->value->u.string_value);
+			work_queue_task_specify_environment_variable(t,p->key->u.string_value,p->value->u.string_value);
 		}
 	}
 }
@@ -213,14 +213,20 @@ static void batch_queue_wq_option_update (struct batch_queue *q, const char *wha
 	if(strcmp(what, "password") == 0) {
 		if(value)
 			work_queue_specify_password(q->data, value);
-	} else if(strcmp(what, "master-mode") == 0) {
+	} else if(strcmp(what, "manager-mode") == 0) {
 		if(strcmp(value, "catalog") == 0)
-			work_queue_specify_master_mode(q->data, WORK_QUEUE_MASTER_MODE_CATALOG);
+			work_queue_specify_manager_mode(q->data, WORK_QUEUE_MANAGER_MODE_CATALOG);
 		else if(strcmp(value, "standalone") == 0)
-			work_queue_specify_master_mode(q->data, WORK_QUEUE_MASTER_MODE_STANDALONE);
+			work_queue_specify_manager_mode(q->data, WORK_QUEUE_MANAGER_MODE_STANDALONE);
 	} else if(strcmp(what, "name") == 0) {
 		if(value)
 			work_queue_specify_name(q->data, value);
+	} else if(strcmp(what, "debug") == 0) {
+		if(value)
+			work_queue_specify_debug_path(q->data, value);
+	} else if(strcmp(what, "tlq-port") == 0) {
+		if(value)
+			work_queue_specify_tlq_port(q->data, atoi(value));
 	} else if(strcmp(what, "priority") == 0) {
 		if(value)
 			work_queue_specify_priority(q->data, atoi(value));
@@ -241,11 +247,11 @@ static void batch_queue_wq_option_update (struct batch_queue *q, const char *wha
 			work_queue_specify_keepalive_timeout(q->data, atoi(value));
 		else
 			work_queue_specify_keepalive_timeout(q->data, WORK_QUEUE_DEFAULT_KEEPALIVE_TIMEOUT);
-	} else if(strcmp(what, "master-preferred-connection") == 0) {
+	} else if(strcmp(what, "manager-preferred-connection") == 0) {
 		if(value)
-			work_queue_master_preferred_connection(q->data, value);
+			work_queue_manager_preferred_connection(q->data, value);
 		else
-			work_queue_master_preferred_connection(q->data, "by_ip");
+			work_queue_manager_preferred_connection(q->data, "by_ip");
 	} else if(strcmp(what, "category-limits") == 0) {
 		struct rmsummary *s = rmsummary_parse_string(value);
 		if(s) {

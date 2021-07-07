@@ -8,6 +8,14 @@ fi
 if [ -z "$CCTOOLS_PACKAGES_TEST" ]
 then
 	CCTOOLS_PACKAGES_TEST=$(grep CCTOOLS_PACKAGES config.mk | cut -d = -f 2)
+	if [ -n "${CCTOOLS_DOCKER_GITHUB}" ]
+	then
+		if ! parrot/src/parrot_run /bin/ls
+		then
+			echo "Skipping parrot tests inside docker build."
+			export PARROT_SKIP_TEST=yes
+		fi
+	fi
 fi
 
 if [ -z "$CCTOOLS_TEST_LOG" ]; then
@@ -58,12 +66,11 @@ for package in ${CCTOOLS_PACKAGES_TEST}; do
 						echo "======== ${script} PREPARE ========"
 						"./${script}" prepare
 						result=$?
-						if [ $result -ne 0 ]; then
-							exit $result
+						if [ $result = 0 ]; then
+							echo "======== ${script} RUN ========"
+							"./${script}" run
+							result=$?
 						fi
-						echo "======== ${script} RUN ========"
-						"./${script}" run
-						result=$?
 						echo "======== ${script} CLEAN ========"
 						"./${script}" clean
 						exit $result

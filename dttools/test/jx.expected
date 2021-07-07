@@ -601,10 +601,10 @@ expression: dirname("..")
 value:      "."
 
 expression: listdir()
-value:      error("function listdir on line 0 takes one argument, 0 given")
+value:      error("function listdir on line 0: one argument required, 0 given")
 
 expression: listdir(7)
-value:      error("function listdir on line 0 takes a string path")
+value:      error("function listdir on line 0: string path required")
 
 expression: listdir("-")
 value:      error("function listdir on line 0: -, No such file or directory")
@@ -710,4 +710,64 @@ value:      error("function template on line 289: undefined symbol in template")
 
 expression: template("bad {object}")
 value:      error("function template on line 290: cannot format expression in template")
+
+expression: schema([{"x":0,"y":"test","z":1}])
+value:      {"z":"float","y":"string","x":"integer"}
+
+expression: select(x<10,[{"x":0,"y":"test","z":1}])
+value:      [{"x":0,"y":"test","z":1}]
+
+expression: select(x>10,[{"x":0,"y":"test","z":1}])
+value:      []
+
+expression: select(y=="test" and z!=0,[{"x":0,"y":"test","z":1}])
+value:      [{"x":0,"y":"test","z":1}]
+
+expression: project(x,[{"x":0,"y":"test","z":1}])
+value:      [0]
+
+expression: project({"z2":z*2},[{"x":0,"y":"test","z":1}])
+value:      [{"z2":2}]
+
+expression: like(".es.*","test")
+value:      true
+
+expression: like("NULL","test")
+value:      false
+
+expression: select(like(".es.*",y),[{"x":0,"y":"test","z":1}])
+value:      [{"x":0,"y":"test","z":1}]
+
+expression:  not  not true
+value:      true
+
+expression:  not  not false
+value:      false
+
+expression: [1,[2,3,4],5,6][1]
+value:      [2,3,4]
+
+expression: [1,[2,3,4],5,6][1][2]
+value:      4
+
+expression: range(1,10)[2:5][2]
+value:      5
+
+expression: keys({})
+value:      []
+
+expression: values({})
+value:      []
+
+expression: items({})
+value:      []
+
+expression: keys({"a":1,"b":2})
+value:      ["b","a"]
+
+expression: values({"a":1,"b":2})
+value:      [2,1]
+
+expression: items({"a":1,"b":2})
+value:      [["b",2],["a",1]]
 

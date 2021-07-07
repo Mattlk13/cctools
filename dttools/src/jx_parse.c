@@ -483,112 +483,142 @@ FAILURE:
 	return NULL;
 }
 
-static struct jx_item *jx_parse_item_list(struct jx_parser *s, bool arglist) {
-	jx_token_t rdelim = arglist ? JX_TOKEN_RPAREN : JX_TOKEN_RBRACKET;
-	jx_token_t t = jx_scan(s);
-	if(t==rdelim) {
-		// empty list
-		return NULL;
-	}
+static struct jx_item *jx_parse_item_list(struct jx_parser *s, bool arglist)
+{
+	struct jx_item *head = 0;
+	struct jx_item **tail = 0;
 
-	jx_unscan(s,t);
+	/* Function arguments end with parens, but lists with brackets. */
+	jx_token_t delim_token = arglist ? JX_TOKEN_RPAREN : JX_TOKEN_RBRACKET;
 
-	struct jx_item *i = jx_item(NULL, NULL);
-	i->line = s->line;
+	while(1) {
+		/* Check for an empty list, or a close brace following a trailing comma. */
+		jx_token_t t = jx_scan(s);
+		if(t==delim_token) return head;
+		jx_unscan(s,t);
 
-	i->value = jx_parse(s);
-	if(!i->value) {
-		// error set by deeper layer
-		jx_item_delete(i);
-		return NULL;
-	}
-	i->comp = jx_parse_comprehension(s);
-	if (jx_parser_errors(s)) {
-		// error set by deeper layer
-		jx_item_delete(i);
-		return NULL;
-	}
+		struct jx_item *i = jx_item(NULL, NULL);
+		i->line = s->line;
 
-	t = jx_scan(s);
-	if(t==JX_TOKEN_COMMA) {
-		i->next = jx_parse_item_list(s, arglist);
+		/* Parse the next value in the list */
+
+		i->value = jx_parse(s);
+		if(!i->value) {
+			// error set by deeper layer
+			jx_item_delete(i);
+			return head;
+		}
+
+		/* A value could be followed by a list comprehension */
+
+		i->comp = jx_parse_comprehension(s);
 		if (jx_parser_errors(s)) {
 			// error set by deeper layer
 			jx_item_delete(i);
-			return NULL;
+			return head;
 		}
-	} else if(t==rdelim) {
-		i->next = NULL;
-	} else {
-		jx_parse_error_c(s,"list of items missing a comma or closing delimiter");
-		jx_item_delete(i);
-		return NULL;
-	}
 
-	return i;
+		/* First item becomes the head, others added to the tail. */
+
+		if(!head) {
+			head = i;
+		} else {
+			*tail = i;
+		}			
+
+		/* Update the tail to the end of this pair. */
+
+		tail = &i->next;
+
+		/* Is this the end of the list or is there more? */
+
+		t = jx_scan(s);
+		if(t==JX_TOKEN_COMMA) {
+			/* keep going */
+		} else if(t==delim_token) {
+			/* end of list */
+			return head;
+		} else {
+			jx_parse_error_c(s,"list of items missing a comma or closing delimiter");
+			return head;
+		}
+	}
 }
 
 static struct jx_pair * jx_parse_pair_list( struct jx_parser *s )
 {
-	jx_token_t t = jx_scan(s);
-	if(t==JX_TOKEN_RBRACE) {
-		// empty list
-		return NULL;
-	}
+	struct jx_pair *head = 0;
+	struct jx_pair **tail = 0;
 
-	jx_unscan(s,t);
+	while(1) {
+		/* Check for an empty list, or a close brace following a trailing comma. */
+		jx_token_t t = jx_scan(s);
+		if(t==JX_TOKEN_RBRACE) return head;
+		jx_unscan(s,t);
 
-	struct jx_pair *p = jx_pair(NULL, NULL, NULL);
+		struct jx_pair *p = jx_pair(NULL, NULL, NULL);
 
-	p->key = jx_parse(s);
-	if(!p->key) {
-		// error set by deeper layer
-		jx_pair_delete(p);
-		return NULL;
-	}
+		/* Parse the key of the pair, which should be a string */
 
-	if(s->strict_mode) {
-		if(p->key->type!=JX_STRING) {
-			jx_parse_error_c(s,"key-value pair must have a string as the key");
-			jx_pair_delete(p);
-			return NULL;
-		}
-	}
-
-	t = jx_scan(s);
-	if(t!=JX_TOKEN_COLON) {
-		char *pstr = jx_print_string(p->key);
-		jx_parse_error_a(s,string_format("key %s must be followed by a colon",pstr));
-		free(pstr);
-		jx_pair_delete(p);
-		return NULL;
-	}
-
-	p->line = s->line;
-	p->value = jx_parse(s);
-	if(!p->value) {
-		// error set by deeper layer
-		jx_pair_delete(p);
-		return NULL;
-	}
-
-	t = jx_scan(s);
-	if(t==JX_TOKEN_COMMA) {
-		p->next = jx_parse_pair_list(s);
-		if (jx_parser_errors(s)) {
+		p->key = jx_parse(s);
+		if(!p->key) {
 			// error set by deeper layer
 			jx_pair_delete(p);
-			return NULL;
+			return head;
 		}
-	} else if(t==JX_TOKEN_RBRACE) {
-		p->next = NULL;
-	} else {
-		jx_parse_error_c(s,"key-value pairs missing a comma or closing brace");
-		jx_pair_delete(p);
-		return NULL;
-	}
 
-	return p;
+		if(s->strict_mode) {
+			if(p->key->type!=JX_STRING) {
+				jx_parse_error_c(s,"key-value pair must have a string as the key");
+				jx_pair_delete(p);
+				return head;
+			}
+		}
+
+		/* Now look for a colon and value to complete the pair. */
+
+		t = jx_scan(s);
+		if(t!=JX_TOKEN_COLON) {
+			char *pstr = jx_print_string(p->key);
+			jx_parse_error_a(s,string_format("key %s must be followed by a colon",pstr));
+			free(pstr);
+			jx_pair_delete(p);
+			return head;
+		}
+
+		p->line = s->line;
+		p->value = jx_parse(s);
+		if(!p->value) {
+			// error set by deeper layer
+			jx_pair_delete(p);
+			return head;
+		}
+
+		/* First item becomes the head, others added to the tail. */
+
+		if(!head) {
+			head = p;
+		} else {
+			*tail = p;
+		}			
+
+		/* Update the tail to the end of this pair. */
+
+		tail = &p->next;
+
+		/* Is this the end of the list, or is there more? */
+
+		t = jx_scan(s);
+		if(t==JX_TOKEN_COMMA) {
+			/* keep going */
+		} else if(t==JX_TOKEN_RBRACE) {
+			/* end of list */
+			return head;
+		} else {
+			jx_parse_error_c(s,"key-value pairs missing a comma or closing brace");
+			return head;
+		}
+	}
 }
 
 static struct jx *jx_parse_atomic(struct jx_parser *s, bool arglist) {
@@ -734,7 +764,14 @@ static bool jx_operator_is_unary(jx_operator_t op) {
 	}
 }
 
-static struct jx *jx_parse_index(struct jx_parser *s) {
+/*
+An array index can consist of a plain expression,
+or a range of values separated by a colon, indicating
+a slice of the indexed array.
+*/
+
+static struct jx *jx_parse_array_index(struct jx_parser *s)
+{
 	struct jx *left = NULL;
 	struct jx *right = NULL;
 
@@ -774,21 +811,29 @@ FAIL:
 	return NULL;
 }
 
-static struct jx *jx_parse_postfix(struct jx_parser *s) {
-	struct jx *a = jx_parse_atomic(s, false);
-	if (!a) return NULL;
+/*
+jx_parse_postfix_oper looks for zero or more postfix operators
+(such as function arguments or array indexes) that follow an
+atomic expression a.  This function will return either the
+original expression a, or a postfix operator on the original
+expression a.  On error, the expression a is deleted.
+*/
 
+static struct jx *jx_parse_postfix_oper(struct jx_parser *s, struct jx *a )
+{
 	jx_token_t t = jx_scan(s);
 	switch (t) {
 		case JX_TOKEN_LBRACKET: {
 			unsigned line = s->line;
-			struct jx *b = jx_parse_index(s);
+
+			// Parse the index expression inside the bracket.
+			struct jx *b = jx_parse_array_index(s);
 			if (!b) {
 				jx_delete(a);
-				// parse error already set
-				return NULL;
+				return 0;
 			}
 
+			// Must be followed by a closing bracket.
 			t = jx_scan(s);
 			if (t != JX_TOKEN_RBRACKET) {
 				jx_parse_error_c(s, "missing closing bracket");
@@ -796,27 +841,66 @@ static struct jx *jx_parse_postfix(struct jx_parser *s) {
 				jx_delete(b);
 				return NULL;
 			}
+
+			// Create a new expression on the two values.
 			struct jx *j = jx_operator(JX_OP_LOOKUP, a, b);
 			j->line = line;
 			j->u.oper.line = line;
-			return j;
+
+			// Multiple postfix operations can be stacked
+			return jx_parse_postfix_oper(s,j);
 		}
 		case JX_TOKEN_LPAREN: {
+			if (!jx_istype(a, JX_SYMBOL)) {
+					jx_parse_error_c(s, "function names must be symbols");
+					jx_delete(a);
+					return NULL;
+			}
 			unsigned line = s->line;
 			jx_unscan(s, t);
+
+			// The left side must be a function name.
+			if(!jx_istype(a,JX_SYMBOL)) {
+				jx_parse_error_c(s, "function arguments () must follow a function name");
+				jx_delete(a);
+				return 0;
+			}
+
+			// Get the function arguments, including both parens.
 			struct jx *args = jx_parse_atomic(s, true);
-			// error set by deeper level
-			if (!args) return NULL;
+			if (!args) {
+				jx_delete(a);
+				return NULL; 
+			}
+
+			// Create a new expression on the two values.
 			struct jx *j = jx_operator(JX_OP_CALL, a, args);
 			j->line = line;
 			j->u.oper.line = line;
-			return j;
+
+			// Multiple postfix operations can be stacked
+			return jx_parse_postfix_oper(s,j);
 		}
 		default: {
+			// No postfix operator, so return the atomic value.
 			jx_unscan(s, t);
 			return a;
 		}
 	}
+}
+
+/*
+jx_parse_postfix_expr looks for an atomic expression,
+followed by zero or more postfix operators, together
+making a postfix expression.
+*/
+
+static struct jx *jx_parse_postfix_expr(struct jx_parser *s)
+{
+	struct jx *a = jx_parse_atomic(s, false);
+	if(!a) return 0;
+
+	return jx_parse_postfix_oper(s,a);
 }
 
 static struct jx * jx_parse_unary( struct jx_parser *s )
@@ -828,7 +912,7 @@ static struct jx * jx_parse_unary( struct jx_parser *s )
 		case JX_TOKEN_C_NOT:
 		case JX_TOKEN_NOT: {
 			unsigned line = s->line;
-			struct jx *j = jx_parse_postfix(s);
+			struct jx *j = jx_parse_unary(s);
 			if (!j) {
 				// error set by deeper level
 				return NULL;
@@ -862,7 +946,7 @@ static struct jx * jx_parse_unary( struct jx_parser *s )
 				return NULL;
 			}
 
-			struct jx *j = jx_parse_postfix(s);
+			struct jx *j = jx_parse_postfix_expr(s);
 			if (!j) {
 				// error set by deeper level
 				return NULL;
@@ -882,7 +966,7 @@ static struct jx * jx_parse_unary( struct jx_parser *s )
 		}
 		default: {
 			jx_unscan(s,t);
-			return jx_parse_postfix(s);
+			return jx_parse_postfix_expr(s);
 		}
 	}
 }
@@ -981,8 +1065,10 @@ struct jx * jx_parse_stream( FILE *file )
 struct jx * jx_parse_file( const char *name )
 {
 	FILE *file = fopen(name,"r");
-	if (!file)
+	if (!file) {
+		debug(D_JX, "Could not open jx file: %s", name);
 		return NULL;
+	}
 	struct jx *j = jx_parse_stream(file);
 	fclose(file);
 	return j;

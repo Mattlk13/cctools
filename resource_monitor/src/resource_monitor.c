@@ -34,16 +34,16 @@ See the file COPYING for details.
  *
  * Currently, the columns are:
  *
- * wall:          wall time (in usecs).
+ * wall:          wall time (in secs).
  * no.proc:       number of processes
  * cpu-time:      user-mode time + kernel-mode time.
  * vmem:          current total memory size (virtual).
  * rss:           current total resident size.
  * swap:          current total swap usage.
- * bytes_read:    read chars count using *read system calls from disk.
- * bytes_written: writen char count using *write system calls to disk.
- * bytes_received:total bytes received (recv family)
- * bytes_sent:    total bytes sent     (send family)
+ * bytes_read:    read chars count using *read system calls from disk. (in MB)
+ * bytes_written: writen char count using *write system calls to disk. (in MB)
+ * bytes_received:total bytes received (recv family) (in MB)
+ * bytes_sent:    total bytes sent     (send family) (in MB)
  * total_files    total file + directory count of all working directories.
  * disk           total byte count of all working directories.
  *
@@ -176,6 +176,7 @@ FILE  *log_inotify = NULL;      /* List of opened files is written to this file.
 char *template_path = NULL;     /* Prefix of all output files names */
 
 int debug_active = 0;           /* 1 if ACTIVATE_DEBUG_FILE exists. If 1, debug info goes to ACTIVATE_DEBUG_FILE ".log" */
+int enforce_limits = 1;         /* 0 if monitor should only measure, 1 if enforcing resources limits. */
 
 struct jx *verbatim_summary_fields; /* fields added to the summary without change */
 
@@ -253,11 +254,6 @@ int64_t catalog_interval_default = 30;
 /***
  * Utility functions (open log files, proc files, measure time)
  ***/
-
-uint64_t usecs_since_launched()
-{
-	return (usecs_since_epoch() - summary->start);
-}
 
 char *default_summary_name(char *template_path)
 {
@@ -354,7 +350,7 @@ void parse_limit_string(struct rmsummary *limits, char *str)
 	char *value = string_trim_spaces(delim + 1);
 
 	int status = 0;
-	
+
 	double d;
 	status = string_is_float(value, &d);
 
@@ -363,15 +359,7 @@ void parse_limit_string(struct rmsummary *limits, char *str)
 		exit(RM_MONITOR_ERROR);
 	}
 
-	if(strcmp(field, "start") == 0 || strcmp(field, "end") == 0) {
-		// given in seconds, but we need microseconds.
-		d *= USECOND;
-	}
-
-	int64_t tmp_output;
-	rmsummary_to_internal_unit(field, d, &tmp_output, rmsummary_unit_of(field));
-	rmsummary_assign_int_field(limits, field, tmp_output);
-
+	rmsummary_set(limits, field, d);
 	free(pair);
 }
 
@@ -731,7 +719,7 @@ int rmonitor_handle_inotify(void)
 
 #if defined(RESOURCE_MONITOR_USE_INOTIFY)
 	struct inotify_event *evdata = NULL;
-	struct rmonitor_file_info *finfo;
+	struct rmonitor_file_info *finfo = NULL;
 	struct stat fst;
 	char *fname;
 	int nbytes, evc, i;
@@ -800,7 +788,7 @@ void append_network_bw(struct rmonitor_msg *msg) {
 	struct rmonitor_bw_info *new_tail = malloc(sizeof(struct rmonitor_bw_info));
 
 	new_tail->bit_count = 8*msg->data.n;
-	new_tail->start     = msg->start;
+	new_tail->start     = msg->start; //start and end of messages in usecs
 	new_tail->end       = msg->end;
 
 	/* we drop entries older than 60s, unless there are less than 4, so
@@ -808,7 +796,7 @@ void append_network_bw(struct rmonitor_msg *msg) {
 	if(list_size(tx_rx_sizes) > 3) {
 		struct rmonitor_bw_info *head;
 		while((head = list_peek_head(tx_rx_sizes))) {
-			if( head->end + 60*USECOND < new_tail->start) {
+			if( head->end + 60*ONE_SECOND < new_tail->start) {
 				list_pop_head(tx_rx_sizes);
 				free(head);
 			} else {
@@ -830,7 +818,7 @@ int64_t average_bandwidth(int use_min_len) {
 
 	/* if last bit count occured more than a minute ago, report bw as 0 */
 	tail = list_peek_tail(tx_rx_sizes);
-	if(tail->end + 60*USECOND < timestamp_get())
+	if(tail->end + 60*ONE_SECOND < timestamp_get())
 		return 0;
 
 	list_first_item(tx_rx_sizes);
@@ -839,12 +827,14 @@ int64_t average_bandwidth(int use_min_len) {
 	}
 
 	head = list_peek_head(tx_rx_sizes);
-	int64_t len_real = DIV_INT_ROUND_UP(tail->end - head->start, USECOND);
+	double len_real = (tail->end - head->start)/ONE_SECOND;
 
 	/* divide at least by 10s, to smooth noise. */
-	int n = use_min_len ? MAX(10, len_real) : len_real;
+	double n = use_min_len ? MAX(10, len_real) : len_real;
 
-	return DIV_INT_ROUND_UP(sum, n);
+	n *= 1e6; //to Mbps
+
+	return sum/n;
 }
 
 
@@ -895,10 +885,10 @@ struct peak_cores_sample {
 	int64_t cpu_time;
 };
 
-double peak_cores(int64_t wall_time, int64_t cpu_time) {
+double peak_cores(double wall_time, double cpu_time) {
 	static struct list *samples = NULL;
 
-	int64_t max_separation = (60 + 2*interval)*USECOND; /* at least one minute and a complete interval */
+	double max_separation = 60 + 2*interval; /* at least one minute and a complete interval */
 
 	if(!samples) {
 		samples = list_create();
@@ -931,9 +921,8 @@ double peak_cores(int64_t wall_time, int64_t cpu_time) {
 
 	head = list_peek_head(samples);
 
-	int64_t diff_wall = tail->wall_time - head->wall_time;
-	int64_t diff_cpu  = tail->cpu_time  - head->cpu_time;
-
+	double diff_wall = tail->wall_time - head->wall_time;
+	double diff_cpu  = tail->cpu_time  - head->cpu_time;
 
 	if(diff_wall < 60) {
 		/* hack to elimiate noise. if diff_wall < 60s, we return 1. If command runs
@@ -947,50 +936,45 @@ double peak_cores(int64_t wall_time, int64_t cpu_time) {
 
 void rmonitor_collate_tree(struct rmsummary *tr, struct rmonitor_process_info *p, struct rmonitor_mem_info *m, struct rmonitor_wdir_info *d, struct rmonitor_filesys_info *f)
 {
-	tr->wall_time  = usecs_since_epoch() - summary->start;
+	tr->start = summary->start;
+	tr->end   = ((double) usecs_since_epoch()) / ONE_SECOND;
+
+	tr->wall_time  = tr->end - tr->start;
 
 	/* using .delta here because if we use .accumulated, then we lose information of processes that already terminated. */
-	tr->cpu_time  += p->cpu.delta;
-
-	tr->start = summary->start;
-	tr->end   = usecs_since_epoch();
+	tr->cpu_time += ((double) p->cpu.delta) / ONE_SECOND;
+	tr->context_switches += p->ctx.delta;
 
 	tr->cores = 0;
 	tr->cores_avg = 0;
 
 	if(tr->wall_time > 0) {
-		int64_t tmp_output;
-
-		rmsummary_to_internal_unit("cores", peak_cores(tr->wall_time, tr->cpu_time), &tmp_output, "cores");
-		tr->cores= tmp_output;
-
-		rmsummary_to_internal_unit("cores_avg", ((double) tr->cpu_time)/tr->wall_time, &tmp_output, "cores");
-		tr->cores_avg = tmp_output;
+		tr->cores= peak_cores(tr->wall_time, tr->cpu_time);
+		tr->cores_avg = tr->cpu_time/tr->wall_time;
 	}
 
-	tr->max_concurrent_processes = (int64_t) itable_size(processes);
-	tr->total_processes          = summary->total_processes;
+	tr->max_concurrent_processes = (double) itable_size(processes);
+	tr->total_processes          = (double) summary->total_processes;
 
 	/* we use max here, as /proc/pid/smaps that fills *m is not always
 	 * available. This causes /proc/pid/status to become a conservative
 	 * fallback. */
 	if(m->resident > 0) {
-		tr->virtual_memory    = (int64_t) m->virtual;
-		tr->memory   = (int64_t) m->resident;
-		tr->swap_memory       = (int64_t) m->swap;
+		tr->virtual_memory = (double) m->virtual;
+		tr->memory         = (double) m->resident;
+		tr->swap_memory    = (double) m->swap;
 	}
 	else {
-		tr->virtual_memory    = (int64_t) p->mem.virtual;
-		tr->memory   = (int64_t) p->mem.resident;
-		tr->swap_memory       = (int64_t) p->mem.swap;
+		tr->virtual_memory = (double) p->mem.virtual;
+		tr->memory         = (double) p->mem.resident;
+		tr->swap_memory    = (double) p->mem.swap;
 	}
 
-	tr->bytes_read        = (int64_t) (p->io.delta_chars_read + tr->bytes_read);
-	tr->bytes_read       += (int64_t)  p->io.delta_bytes_faulted;
-	tr->bytes_written     = (int64_t) (p->io.delta_chars_written + tr->bytes_written);
+	tr->bytes_read    = ((double) (p->io.delta_chars_read+tr->bytes_read+p->io.delta_bytes_faulted)) / ONE_MEGABYTE;
+	tr->bytes_written = ((double) (p->io.delta_chars_written + tr->bytes_written)) / ONE_MEGABYTE;
 
-	tr->bytes_received = total_bytes_rx;
-	tr->bytes_sent     = total_bytes_tx;
+	tr->bytes_received = ((double) total_bytes_rx) / ONE_MEGABYTE;
+	tr->bytes_sent     = ((double) total_bytes_tx) / ONE_MEGABYTE;
 
 	tr->bandwidth = average_bandwidth(1);
 
@@ -1001,6 +985,11 @@ void rmonitor_collate_tree(struct rmsummary *tr, struct rmonitor_process_info *p
 
 	tr->machine_load = p->load.last_minute;
 	tr->machine_cpus = p->load.cpus;
+
+	// hack: set gpu limit as the measured gpus:
+	if(resources_limits->gpus > 0) {
+		tr->gpus = resources_limits->gpus;
+	}
 }
 
 void rmonitor_find_max_tree(struct rmsummary *result, struct rmsummary *tr)
@@ -1020,28 +1009,24 @@ void rmonitor_log_row(struct rmsummary *tr)
 {
 	if(log_series)
 	{
-		fprintf(log_series,  "%" PRId64, tr->wall_time + summary->start);
-		fprintf(log_series, " %" PRId64, tr->cpu_time);
-		fprintf(log_series, " %" PRId64, tr->cores);
-		fprintf(log_series, " %" PRId64, tr->max_concurrent_processes);
-		fprintf(log_series, " %" PRId64, tr->virtual_memory);
-		fprintf(log_series, " %" PRId64, tr->memory);
-		fprintf(log_series, " %" PRId64, tr->swap_memory);
-		fprintf(log_series, " %" PRId64, tr->bytes_read);
-		fprintf(log_series, " %" PRId64, tr->bytes_written);
-		fprintf(log_series, " %" PRId64, tr->bytes_received);
-		fprintf(log_series, " %" PRId64, tr->bytes_sent);
-		fprintf(log_series, " %" PRId64, tr->bandwidth);
-
-		{
-			double tmp_output = rmsummary_to_external_unit("machine_load", tr->machine_load);
-			fprintf(log_series, " %04.2lf", tmp_output);
-		}
+		fprintf(log_series,  "%s", rmsummary_resource_to_str(tr->wall_time + summary->start, 0));
+		fprintf(log_series, " %s", rmsummary_resource_to_str(tr->cpu_time, 0));
+		fprintf(log_series, " %s", rmsummary_resource_to_str(tr->cores, 0));
+		fprintf(log_series, " %s", rmsummary_resource_to_str(tr->max_concurrent_processes, 0));
+		fprintf(log_series, " %s", rmsummary_resource_to_str(tr->virtual_memory, 0));
+		fprintf(log_series, " %s", rmsummary_resource_to_str(tr->memory, 0));
+		fprintf(log_series, " %s", rmsummary_resource_to_str(tr->swap_memory, 0));
+		fprintf(log_series, " %s", rmsummary_resource_to_str(tr->bytes_read, 0));
+		fprintf(log_series, " %s", rmsummary_resource_to_str(tr->bytes_written, 0));
+		fprintf(log_series, " %s", rmsummary_resource_to_str(tr->bytes_received, 0));
+		fprintf(log_series, " %s", rmsummary_resource_to_str(tr->bytes_sent, 0));
+		fprintf(log_series, " %s", rmsummary_resource_to_str(tr->bandwidth, 0));
+		fprintf(log_series, " %s", rmsummary_resource_to_str(tr->machine_load, 0));
 
 		if(resources_flags->disk)
 		{
-			fprintf(log_series, " %" PRId64, tr->total_files);
-			fprintf(log_series, " %" PRId64, tr->disk);
+			fprintf(log_series, " %s", rmsummary_resource_to_str(tr->total_files, 0));
+			fprintf(log_series, " %s", rmsummary_resource_to_str(tr->disk, 0));
 		}
 
 		fprintf(log_series, "\n");
@@ -1052,9 +1037,6 @@ void rmonitor_log_row(struct rmsummary *tr)
 		/* are we going to keep monitoring the whole filesystem? */
 		// fprintf(log_series "%" PRId64 "\n", tr->fs_nodes);
 	}
-
-	debug(D_RMON, "resources: %" PRId64 " %" PRId64 " %" PRId64 " %" PRId64 " %" PRId64 " %" PRId64 " %" PRId64 " %" PRId64 " %" PRId64 " %" PRId64 " %" PRId64 "% " PRId64 "\n", tr->wall_time + summary->start, tr->cpu_time, tr->max_concurrent_processes, tr->virtual_memory, tr->memory, tr->swap_memory, tr->bytes_read, tr->bytes_written, tr->bytes_received, tr->bytes_sent, tr->total_files, tr->disk);
-
 }
 
 int record_snapshot(struct rmsummary *tr) {
@@ -1079,7 +1061,7 @@ int record_snapshot(struct rmsummary *tr) {
 		snapshots = list_create();
 	}
 
-	snapshot->end       = usecs_since_epoch();
+	snapshot->end       = ((double) usecs_since_epoch() / ONE_SECOND);
 	snapshot->wall_time = snapshot->end - snapshot->start;
 
 	struct jx *j = rmsummary_to_json(tr, /* only resources */ 1);
@@ -1135,9 +1117,14 @@ void decode_zombie_status(struct rmsummary *summary, int wait_status)
 
 	if(summary->limits_exceeded)
 	{
+		/* record that limits were exceeded in the summary, but only change the
+		 * exit_status when enforcing limits. */
 		free(summary->exit_type);
 		summary->exit_type   = xxstrdup("limits");
-		summary->exit_status = 128 + SIGTERM;
+
+		if(enforce_limits) {
+			summary->exit_status = 128 + SIGTERM;
+		}
 	}
 }
 
@@ -1243,9 +1230,7 @@ int rmonitor_final_summary()
 	}
 
 	if(summary->wall_time > 0) {
-		int64_t tmp_output;
-		rmsummary_to_internal_unit("cores_avg", ((double) summary->cpu_time)/summary->wall_time, &tmp_output, "cores");
-		summary->cores_avg = tmp_output;
+		summary->cores_avg = summary->cpu_time/summary->wall_time;
 	}
 
 	if(log_inotify)
@@ -1288,7 +1273,7 @@ int rmonitor_final_summary()
 
 	int status;
 
-	if(summary->limits_exceeded) {
+	if(summary->limits_exceeded && enforce_limits) {
 		status = RM_OVERFLOW;
 	} else if(summary->exit_status != 0) {
 		status = RM_TASK_ERROR;
@@ -1500,31 +1485,27 @@ struct rmsummary *rmonitor_final_usage_tree(void)
 
 	if(usg.ru_majflt > 0) {
 		/* Here we add the maximum recorded + the io from memory maps */
-		tr_usg->bytes_read     =  summary->bytes_read + usg.ru_majflt * sysconf(_SC_PAGESIZE);
+		tr_usg->bytes_read = summary->bytes_read + (((double) usg.ru_majflt * sysconf(_SC_PAGESIZE)) / ONE_MEGABYTE);
 		debug(D_RMON, "page faults: %ld.\n", usg.ru_majflt);
 	}
 
 	tr_usg->cpu_time  = 0;
-	tr_usg->cpu_time += usg.ru_utime.tv_sec*USECOND + usg.ru_utime.tv_usec;
-	tr_usg->cpu_time += usg.ru_stime.tv_sec*USECOND + usg.ru_stime.tv_usec;
-	tr_usg->end       = usecs_since_epoch();
-	tr_usg->wall_time = tr_usg->end - summary->start;
+	tr_usg->cpu_time += usg.ru_utime.tv_sec + (((double) usg.ru_utime.tv_usec) / ONE_SECOND);
+	tr_usg->cpu_time += usg.ru_stime.tv_sec + (((double) usg.ru_stime.tv_usec) / ONE_SECOND);
+	tr_usg->start     = summary->start;
+	tr_usg->end       = ((double) usecs_since_epoch() / ONE_SECOND);
+	tr_usg->wall_time = tr_usg->end - tr_usg->start;
 
 	/* we do not use peak_cores here, as we may have missed some threads which
 	 * make cpu_time quite jumpy. */
-	
 	if(tr_usg->wall_time > 0) {
-		int64_t tmp_output;
-		rmsummary_to_internal_unit("cores", ((double) tr_usg->cpu_time)/tr_usg->wall_time, &tmp_output, "cores");
-		tr_usg->cores     = tmp_output;
-
-		rmsummary_to_internal_unit("cores_avg", ((double) tr_usg->cpu_time)/tr_usg->wall_time, &tmp_output, "cores");
-		tr_usg->cores_avg = tmp_output;
+		tr_usg->cores     = tr_usg->cpu_time/tr_usg->wall_time;
+		tr_usg->cores_avg = tr_usg->cores;
 	}
 
 	tr_usg->bandwidth      = average_bandwidth(0);
-	tr_usg->bytes_received = total_bytes_rx;
-	tr_usg->bytes_sent     = total_bytes_tx;
+	tr_usg->bytes_received = ((double) total_bytes_rx) / ONE_MEGABYTE;
+	tr_usg->bytes_sent     = ((double) total_bytes_tx) / ONE_MEGABYTE;
 
     return tr_usg;
 }
@@ -1818,8 +1799,9 @@ int rmonitor_dispatch_msg(void)
 
 	summary->last_error = msg.error;
 
-	if(!rmsummary_check_limits(summary, resources_limits))
+	if(!rmsummary_check_limits(summary, resources_limits) && enforce_limits) {
 		rmonitor_final_cleanup(SIGTERM);
+	}
 
 	// find out if messages are urgent:
 	if(msg.type == SNAPSHOT) {
@@ -2006,6 +1988,10 @@ struct rmonitor_process_info *spawn_first_process(const char *executable, char *
 
         debug(D_RMON, "executing: %s\n", executable);
 
+		char *pid_s = string_format("%d", getpid());
+		setenv(RESOURCE_MONITOR_ROOT_PROCESS, pid_s, 1);
+		free(pid_s);
+
 		errno = 0;
         execvp(executable, argv);
         //We get here only if execlp fails.
@@ -2024,7 +2010,7 @@ static void show_help(const char *cmd)
 {
     fprintf(stdout, "\nUse: %s [options] -- command-line-and-options\n\n", cmd);
     fprintf(stdout, "%-30s Enable debugging for this subsystem.\n", "-d,--debug=<subsystem>");
-	fprintf(stdout, "%-30s Send debugging to this file. (can also be :stderr, :stdout, :syslog, or :journal)\n", "-o,--debug-file=<file>");
+	fprintf(stdout, "%-30s Send debugging to this file. (can also be :stderr, or :stdout)\n", "-o,--debug-file=<file>");
     fprintf(stdout, "%-30s Show this message.\n", "-h,--help");
     fprintf(stdout, "%-30s Show version string.\n", "-v,--version");
     fprintf(stdout, "\n");
@@ -2036,6 +2022,7 @@ static void show_help(const char *cmd)
     fprintf(stdout, "%-30s Use maxfile with list of var: value pairs for resource limits.\n", "-l,--limits-file=<maxfile>");
     fprintf(stdout, "%-30s Use string of the form \"var: value, var: value\" to specify.\n", "-L,--limits=<string>");
     fprintf(stdout, "%-30s resource limits. Can be specified multiple times.\n", "");
+    fprintf(stdout, "%-30s Do not enforce resource limits, only measure resources.\n", "--measure-only");
     fprintf(stdout, "\n");
     fprintf(stdout, "%-30s Keep the monitored process in foreground (for interactive use).\n", "-f,--child-in-foreground");
     fprintf(stdout, "\n");
@@ -2101,7 +2088,7 @@ int rmonitor_resources(long int interval /*in seconds */)
 		rmonitor_find_max_tree(snapshot, resources_now);
 		rmonitor_log_row(resources_now);
 
-		if(!rmsummary_check_limits(summary, resources_limits)) {
+		if(!rmsummary_check_limits(summary, resources_limits) && enforce_limits) {
 			rmonitor_final_cleanup(SIGTERM);
 		}
 
@@ -2112,7 +2099,7 @@ int rmonitor_resources(long int interval /*in seconds */)
 		if(record_snapshot(snapshot)) {
 			rmsummary_delete(snapshot);
 			snapshot = calloc(1, sizeof(*snapshot));
-			snapshot->start = usecs_since_epoch();
+			snapshot->start = ((double) usecs_since_epoch()) / ONE_SECOND;
 		}
 
 		send_catalog_update(resources_now, 0);
@@ -2208,7 +2195,8 @@ int main(int argc, char **argv) {
 		LONG_OPT_CATALOG_SERVER,
 		LONG_OPT_CATALOG_PROJECT,
 		LONG_OPT_CATALOG_INTERVAL,
-		LONG_OPT_PID
+		LONG_OPT_PID,
+		LONG_OPT_MEASURE_ONLY
 	};
 
     static const struct option long_options[] =
@@ -2223,6 +2211,7 @@ int main(int argc, char **argv) {
 		    {"limits-file",required_argument, 0, 'l'},
 		    {"sh",         required_argument, 0, 'c'},
 		    {"pid",        required_argument, 0, LONG_OPT_PID},
+		    {"measure-only", no_argument, 0, LONG_OPT_MEASURE_ONLY},
 
 		    {"verbatim-to-summary",required_argument, 0, 'V'},
 
@@ -2342,6 +2331,9 @@ int main(int argc, char **argv) {
 					first_pid_manually_set = 1;
 					first_process_pid = (pid_t) p;
 				}
+				break;
+			case LONG_OPT_MEASURE_ONLY:
+				enforce_limits = 0;
 				break;
 			case LONG_OPT_CATALOG_TASK_READABLE_NAME:
 				catalog_task_readable_name = xxstrdup(optarg);
@@ -2495,7 +2487,7 @@ int main(int argc, char **argv) {
     log_inotify = open_log_file(opened_path);
 
     summary->command = xxstrdup(command_line);
-    summary->start   = usecs_since_epoch();
+    summary->start   = ((double) usecs_since_epoch()) / ONE_SECOND;
     snapshot->start  = summary->start;
 
 #if defined(RESOURCE_MONITOR_USE_INOTIFY)

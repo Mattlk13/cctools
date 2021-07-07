@@ -1846,7 +1846,7 @@ static void show_help(const char *cmd)
 	fprintf(stdout, "The most common options are:\n");
 	fprintf(stdout, " %-30s URL of storage directory, like `file://path' or `hdfs://host:port/path'.\n", "-r,--root=<url>");
 	fprintf(stdout, " %-30s Enable debugging for this subsystem.\n", "-d,--debug=<name>");
-	fprintf(stdout, " %-30s Send debugging to this file. (can also be :stderr, :stdout, :syslog, or :journal)\n", "-o,--debug-file=<file>");
+	fprintf(stdout, " %-30s Send debugging to this file. (can also be :stderr, or :stdout)\n", "-o,--debug-file=<file>");
 	fprintf(stdout, " %-30s Send status updates to this host. (default: `%s')\n", "-u,--advertise=<host>", CATALOG_HOST);
 	fprintf(stdout, " %-30s Show version info.\n", "-v,--version");
 	fprintf(stdout, " %-30s This message.\n", "-h,--help");
@@ -2283,7 +2283,7 @@ int main(int argc, char *argv[])
 			gc_alarm = time(0) + GC_TIMEOUT;
 		}
 
-		/* Wait for action on one of two ports: the master TCP port, or the internal pipe. */
+		/* Wait for action on one of two ports: the main TCP port, or the internal pipe. */
 		/* If the limit of child procs has been reached, don't watch the TCP port. */
 
 		fd_set rfds;

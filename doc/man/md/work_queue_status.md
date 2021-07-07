@@ -27,13 +27,13 @@
 **work_queue_status** - display status of currently running Work Queue applications.
 
 ## SYNOPSIS
-****work_queue_status [options] [master] [port]****
+****work_queue_status [options] [manager] [port]****
 
 ## DESCRIPTION
 
 **work_queue_status** displays the status of currently running Work Queue applications.
 When run with no options, it queries the global catalog server to list the currently running
-Work Queue masters.  When given an address and a port, it queries a master directly to obtain
+Work Queue managers.  When given an address and a port, it queries a manager directly to obtain
 more detailed information about tasks and workers.
 
 
@@ -47,19 +47,19 @@ more detailed information about tasks and workers.
 
 ## OPTIONS
 
-- **--where expr**  Show only Work Queue masters matching this expression.
+- **--where expr**  Show only Work Queue managers matching this expression.
 - **-Q, --statistics** Show summary information about queues. (default)
-- **-M, --project-name=<name>** Filter results of -Q for masters matching <name>.
-- **-W, --workers** Show details of all workers connected to the master.
+- **-M, --project-name=<name>** Filter results of -Q for managers matching <name>.
+- **-W, --workers** Show details of all workers connected to the manager.
 - **-T, --tasks** Show details of all tasks in the queue.
-- **-A, --able-workers** List categories of the given master, size of largest task, and workers that can run it.
-- **-R, --resources** Show available resources for each master.
-- **--capacity** Show resource capacities for each master.
+- **-A, --able-workers** List categories of the given manager, size of largest task, and workers that can run it.
+- **-R, --resources** Show available resources for each manager.
+- **--capacity** Show resource capacities for each manager.
 - **-l, --verbose** Long output.
 - **-C --catalog <catalog>** Set catalog server to <catalog>. Format: HOSTNAME:PORT
 - **-d --debug <flag>** Enable debugging for the given subsystem. Try -d all as a start.
 - **-t --timeout <time>** RPC timeout (default=300s).
-- **-o --debug-file <file>** Send debugging to this file. (can also be :stderr, :stdout, :syslog, or :journal)
+- **-o --debug-file <file>** Send debugging to this file. (can also be :stderr, or :stdout)
 - **-O --debug-rotate-max <bytes>** Rotate debug file once it reaches this size.
 - **-v, --version** Show work_queue_status version.
 - **-h, --help** Show this help message.
@@ -78,26 +78,26 @@ shrimp             cclws16.cse.nd.edu     9001     963      37        2      33
 crustacea          terra.solar.edu        9000       0    2310    32084     700
 ```
 
-With the **-R** option, a summary of the resources available to each master is shown:
+With the **-R** option, a summary of the resources available to each manager is shown:
 
 ```
 $ work_queue_status -R
-MASTER                         CORES      MEMORY          DISK
+MANAGER                         CORES      MEMORY          DISK
 shrimp                         228        279300          932512
 crustacea                      4200       4136784         9049985
 ```
 
-With the **--capacity** option, a summary of the resource capacities for each master is shown:
+With the **--capacity** option, a summary of the resource capacities for each manager is shown:
 
 ```
 $ work_queue_status --capacity
-MASTER                         TASKS      CORES      MEMORY          DISK
+MANAGER                         TASKS      CORES      MEMORY          DISK
 refine                         ???        ???        ???             ???
 shrimp                         99120      99120      781362960       1307691584
 crustacea                      318911     318911     326564864       326564864
 ```
 
-Use the **-W** option to list the workers connected to a particular master.
+Use the **-W** option to list the workers connected to a particular manager.
 Completed and running columns refer to numbers of tasks:
 
 ```
@@ -129,7 +129,7 @@ The **-A** option shows a summary of the resources observed per task
 category.
 
 ```
-$ work_queue_status -T cclws16.cse.nd.edu 9001
+$ work_queue_status -A cclws16.cse.nd.edu 9001
 CATEGORY        RUNNING    WAITING  FIT-WORKERS  MAX-CORES MAX-MEMORY   MAX-DISK
 analysis            216        784           54          4      ~1011      ~3502
 merge                20         92           30         ~1      ~4021      21318

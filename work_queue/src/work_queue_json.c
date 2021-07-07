@@ -14,7 +14,7 @@ See the file COPYING for details.
 #include <stdlib.h>
 #include <string.h>
 
-static const char *work_queue_properties[] = { "name", "port", "priority", "num_tasks_left", "next_taskid", "workingdir", "master_link",
+static const char *work_queue_properties[] = { "name", "port", "priority", "num_tasks_left", "next_taskid", "workingdir", "manager_link",
 	"poll_table", "poll_table_size", "tasks", "task_state_map", "ready_list", "worker_table",
 	"worker_blacklist", "worker_task_map", "categories", "workers_with_available_results",
 	"stats", "stats_measure", "stats_disconnected_workers", "time_last_wait",
@@ -24,12 +24,12 @@ static const char *work_queue_properties[] = { "name", "port", "priority", "num_
 	"default_transfer_rate", "catalog_hosts", "catalog_last_update_time",
 	"resources_last_update_time", "busy_waiting_flag", "allocation_default_mode", "logfile",
 	"transactions_logfile", "keepalive_interval", "keepalive_timeout", "link_poll_end",
-	"master_preferred_connection", "monitor_mode", "monitor_file", "monitor_output_directory",
+	"manager_preferred_connection", "monitor_mode", "monitor_file", "monitor_output_directory",
 	"monitor_summary_filename", "monitor_exe", "measured_local_resources",
-	"current_max_worker", "password", "bandwidth"
+	"current_max_worker", "password", "bandwidth", NULL
 };
 
-static const char *work_queue_task_properties[] = { "tag", "command_line", "worker_selection_algorithm", "output", "input_files",
+static const char *work_queue_task_properties[] = { "tag", "command_line", "worker_selection_algorithm", "output", "input_files", "environment",
 	"output_files", "env_list", "taskid", "return_status", "result", "host", "hostname",
 	"category", "resource_request", "priority", "max_retries", "try_count",
 	"exhausted_attempts", "time_when_submitted", "time_when_done",
@@ -44,7 +44,7 @@ static const char *work_queue_task_properties[] = { "tag", "command_line", "work
 	"time_execute_cmd_finish", "total_transfer_time", "cmd_execution_time",
 	"total_cmd_execution_time", "total_cmd_exhausted_execute_time",
 	"total_time_until_worker_failure", "total_bytes_received", "total_bytes_sent",
-	"total_bytes_transferred", "time_app_delay"
+	"total_bytes_transferred", "time_app_delay", "cores", "memory", "disk", NULL
 };
 
 
@@ -96,13 +96,11 @@ static int specify_files(int input, struct jx *files, struct work_queue_task *ta
 
 	while(arr != NULL) {
 
-		char *local, *remote;
+		char *local = NULL;
+		char *remote = NULL;
 		struct jx_pair *flag;
 		void *k = NULL;
 		void *v = NULL;
-		int cache = 1;
-		int nocache = 0;
-		int watch = 16;
 		int flags = 0;
 
 		const char *key = jx_iterate_keys(arr, &k);
@@ -120,26 +118,22 @@ static int specify_files(int input, struct jx *files, struct work_queue_task *ta
 				while(flag) {
 					char *flag_key = flag->key->u.string_value;
 					bool flag_value = flag->value->u.boolean_value;
-					if(!strcmp(flag_key, "WORK_QUEUE_NOCACHE")) {
+					if(!strcmp(flag_key, "cache")) {
 						if(flag_value) {
-							flags |= nocache;
+							flags |= WORK_QUEUE_CACHE;
 						}
-					} else if(!strcmp(flag_key, "WORK_QUEUE_CACHE")) {
+					} else if(!strcmp(flag_key, "watch")) {
 						if(flag_value) {
-							flags |= cache;
-						}
-					} else if(!strcmp(flag_key, "WORK_QUEUE_WATCH")) {
-						if(flag_value) {
-							flags |= watch;
+							flags |= WORK_QUEUE_WATCH;
 						}
 					} else {
-						printf("KEY ERROR: %s not valid", flag_key);
+						printf("KEY ERROR: %s not valid\n", flag_key);
 						return 1;
 					}
 					flag = flag->next;
 				}
 			} else {
-				printf("KEY ERROR: %s not valid", key);
+				printf("KEY ERROR: %s not valid\n", key);
 				return 1;
 			}
 
@@ -162,12 +156,32 @@ static int specify_files(int input, struct jx *files, struct work_queue_task *ta
 
 }
 
+static int specify_environment(struct jx *environment, struct work_queue_task *task)
+{
+	void *j = NULL;
+	void *i = NULL;
+	const char *key = jx_iterate_keys(environment, &j);
+	struct jx *value = jx_iterate_values(environment, &i);
+
+	while(key != NULL) {
+		work_queue_task_specify_environment_variable(task, key, value->u.string_value);
+		key = jx_iterate_keys(environment, &j);
+		value = jx_iterate_values(environment, &i);
+	}
+
+	return 0;
+}
+
+
 
 static struct work_queue_task *create_task(const char *str)
 {
 
-	char *command_line;
-	struct jx *input_files, *output_files;
+	char *command_line = NULL;
+	struct jx *input_files = NULL;
+	struct jx *output_files = NULL;
+	struct jx *environment = NULL;
+	int cores = 0, memory = 0, disk = 0;
 
 	struct jx *json = jx_parse_string(str);
 	if(!json) {
@@ -191,8 +205,16 @@ static struct work_queue_task *create_task(const char *str)
 			input_files = value;
 		} else if(!strcmp(key, "output_files")) {
 			output_files = value;
+		} else if(!strcmp(key, "environment")) {
+			environment = value;
+		} else if(!strcmp(key, "cores")) {
+			cores = value->u.integer_value;
+		} else if(!strcmp(key, "memory")) {
+			memory = value->u.integer_value;
+		} else if(!strcmp(key, "disk")) {
+			disk = value->u.integer_value;
 		} else {
-			printf("%s\n", value->u.string_value);
+			printf("%s\n", key);
 		}
 
 		key = jx_iterate_keys(json, &j);
@@ -217,6 +239,21 @@ static struct work_queue_task *create_task(const char *str)
 			specify_files(0, output_files, task);
 		}
 
+		if(environment) {
+			specify_environment(environment, task);
+		}
+
+		if(cores) {
+			work_queue_task_specify_cores(task, cores);
+		}
+
+		if(memory) {
+			work_queue_task_specify_memory(task, memory);
+		}
+
+		if(disk) {
+			work_queue_task_specify_disk(task, disk);
+		}
 		return task;
 
 	}
@@ -229,8 +266,8 @@ struct work_queue *work_queue_json_create(const char *str)
 {
 
 
-	int port = 0, priority = 0;
-	char *name;
+	int port = -1, priority = 0;
+	char *name = NULL;
 
 	struct jx *json = jx_parse_string(str);
 	if(!json) {
@@ -255,7 +292,7 @@ struct work_queue *work_queue_json_create(const char *str)
 		} else if(!strcmp(key, "priority")) {
 			priority = value->u.integer_value;
 		} else {
-			printf("Not necessary: %s\n", value->u.string_value);
+			printf("Not necessary: %s\n", key);
 		}
 
 		key = jx_iterate_keys(json, &j);
@@ -263,7 +300,7 @@ struct work_queue *work_queue_json_create(const char *str)
 
 	}
 
-	if(port) {
+	if(port >= 0) {
 
 		struct work_queue *workqueue = work_queue_create(port);
 
@@ -310,6 +347,10 @@ char *work_queue_json_wait(struct work_queue *q, int timeout)
 
 	struct work_queue_task *t = work_queue_wait(q, timeout);
 
+	if(!t) {
+		return NULL;
+	}
+
 	command_line = jx_pair(jx_string("command_line"), jx_string(t->command_line), NULL);
 	taskid = jx_pair(jx_string("taskid"), jx_integer(t->taskid), command_line);
 	return_status = jx_pair(jx_string("return_status"), jx_integer(t->return_status), taskid);
@@ -326,7 +367,6 @@ char *work_queue_json_wait(struct work_queue *q, int timeout)
 	task = jx_print_string(j);
 
 	return task;
-
 }
 
 char *work_queue_json_remove(struct work_queue *q, int id)
@@ -350,5 +390,35 @@ char *work_queue_json_remove(struct work_queue *q, int id)
 	task = jx_print_string(j);
 
 	return task;
+
+}
+
+char *work_queue_json_get_status(struct work_queue *q)
+{
+	char *status;
+	struct work_queue_stats s;
+	struct jx *j;
+	struct jx_pair *workers_connected, *workers_idle, *workers_busy, *tasks_waiting, *tasks_on_workers, *tasks_running, *tasks_with_results, *tasks_submitted, *tasks_done, *tasks_failed, *bytes_sent, *bytes_received;
+
+	work_queue_get_stats(q, &s);
+
+	workers_connected = jx_pair(jx_string("workers_connected"), jx_integer(s.workers_connected), NULL);
+	workers_idle = jx_pair(jx_string("workers_idle"), jx_integer(s.workers_idle), workers_connected);
+	workers_busy = jx_pair(jx_string("workers_busy"), jx_integer(s.workers_busy), workers_idle);
+	tasks_waiting = jx_pair(jx_string("tasks_waiting"), jx_integer(s.tasks_waiting), workers_busy);
+	tasks_on_workers = jx_pair(jx_string("tasks_on_workers"), jx_integer(s.tasks_on_workers), tasks_waiting);
+	tasks_running = jx_pair(jx_string("tasks_running"), jx_integer(s.tasks_running), tasks_on_workers);
+	tasks_with_results = jx_pair(jx_string("tasks_with_results"), jx_integer(s.tasks_with_results), tasks_running);
+	tasks_submitted = jx_pair(jx_string("tasks_submitted"), jx_integer(s.tasks_submitted), tasks_with_results);
+	tasks_done = jx_pair(jx_string("tasks_done"), jx_integer(s.tasks_done), tasks_submitted);
+	tasks_failed = jx_pair(jx_string("tasks_failed"), jx_integer(s.tasks_failed), tasks_done);
+	bytes_sent = jx_pair(jx_string("bytes_sent"), jx_integer(s.bytes_sent), tasks_failed);
+	bytes_received = jx_pair(jx_string("bytes_received"), jx_integer(s.bytes_received), bytes_sent);
+
+	j = jx_object(bytes_received);
+
+	status = jx_print_string(j);
+
+	return status;
 
 }

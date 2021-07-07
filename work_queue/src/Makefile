@@ -13,7 +13,8 @@ SOURCES_LIBRARY = \
 
 SOURCES_WORKER = \
 	work_queue_process.o \
-	work_queue_watcher.o
+	work_queue_watcher.o \
+	work_queue_gpus.o
 
 PUBLIC_HEADERS = work_queue.h
 
@@ -24,10 +25,10 @@ LIBRARIES = libwork_queue.a
 OBJECTS = $(OBJECTS_LIBRARY) $(OBJECTS_WORKER) work_queue_test_main.o
 OBJECTS_LIBRARY = $(SOURCES_LIBRARY:%.c=%.o)
 OBJECTS_WORKER = $(SOURCES_WORKER:%.c=%.o)
-PROGRAMS = work_queue_worker work_queue_status work_queue_example
+PROGRAMS = work_queue_worker work_queue_status work_queue_example work_queue_server
 PUBLIC_HEADERS = work_queue.h work_queue_catalog.h work_queue_json.h
 SCRIPTS = work_queue_submit_common condor_submit_workers sge_submit_workers torque_submit_workers pbs_submit_workers slurm_submit_workers work_queue_graph_log
-TEST_PROGRAMS = work_queue_example work_queue_test work_queue_test_watch work_queue_priority_test work_queue_json_example
+TEST_PROGRAMS = work_queue_example work_queue_test work_queue_test_watch work_queue_priority_test work_queue_example_json
 TARGETS = $(LIBRARIES) $(PROGRAMS) $(TEST_PROGRAMS) sge_submit_workers bindings
 
 all: $(TARGETS)
@@ -39,7 +40,7 @@ $(PROGRAMS) $(TEST_PROGRAMS): libwork_queue.a $(EXTERNAL_DEPENDENCIES)
 
 bindings: libwork_queue.a work_queue.i $(EXTERNAL_DEPENDENCIES)
 	@$(MAKE) -C bindings
-	
+
 sge_submit_workers: sge_submit_workers_common
 	sed -e "s/SGE_CUSTOM_PARAMETERS/${CCTOOLS_SGE_PARAMETERS}/" $< > $@
 	chmod 755 $@

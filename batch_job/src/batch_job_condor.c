@@ -153,11 +153,13 @@ static batch_job_id_t batch_job_condor_submit (struct batch_queue *q, const char
 	int64_t cores  = 1;
 	int64_t memory = 1024;
 	int64_t disk   = 1024;
+	int64_t gpus   = 0;
 
 	if(resources) {
 		cores  = resources->cores  > -1 ? resources->cores  : cores;
 		memory = resources->memory > -1 ? resources->memory : memory;
 		disk   = resources->disk   > -1 ? resources->disk   : disk;
+ 		gpus   = resources->gpus   > -1 ? resources->gpus   : gpus;
 	}
 
 	/* convert disk to KB */
@@ -167,11 +169,17 @@ static batch_job_id_t batch_job_condor_submit (struct batch_queue *q, const char
 		fprintf(file, "request_cpus   = ifThenElse(%" PRId64 " > TotalSlotCpus, %" PRId64 ", TotalSlotCpus)\n", cores, cores);
 		fprintf(file, "request_memory = ifThenElse(%" PRId64 " > TotalSlotMemory, %" PRId64 ", TotalSlotMemory)\n", memory, memory);
 		fprintf(file, "request_disk   = ifThenElse((%" PRId64 ") > TotalSlotDisk, (%" PRId64 "), TotalSlotDisk)\n", disk, disk);
+		if(gpus>0) {
+			fprintf(file, "request_gpus   = ifThenElse((%" PRId64 ") > TotalSlotGpus, (%" PRId64 "), TotalSlotGpus)\n", gpus, gpus);
+		}
 	}
 	else {
 			fprintf(file, "request_cpus = %" PRId64 "\n", cores);
 			fprintf(file, "request_memory = %" PRId64 "\n", memory);
 			fprintf(file, "request_disk = %" PRId64 "\n", disk);
+			if(gpus>0) {
+				fprintf(file, "request_gpus = %" PRId64 "\n", gpus);
+			}
 	}
 
 	if(options) {
@@ -219,6 +227,18 @@ static batch_job_id_t batch_job_condor_wait (struct batch_queue * q, struct batc
 		}
 	}
 
+	time_t current;
+	struct tm tm;
+
+	/* Obtain current year, in case HTCondor log lines do not provide a year.
+	   Note that this fallback may give the incorrect year for jobs that run
+	   when the year turns. However, we just need some value to give to a
+	   mktime below, and the current year is preferable than some fixed value.
+	   */
+	time(&current);
+	tm = *localtime(&current);
+	int current_year = tm.tm_year + 1900;
+
 	while(1) {
 		/*
 		   Note: clearerr is necessary to clear any cached end-of-file condition,
@@ -232,14 +252,26 @@ static batch_job_id_t batch_job_condor_wait (struct batch_queue * q, struct batc
 		while(fgets(line, sizeof(line), logfile)) {
 			int type, proc, subproc;
 			batch_job_id_t jobid;
-			time_t current;
-			struct tm tm;
 
 			struct batch_job_info *info;
 			int logcode, exitcode;
 
-			if(sscanf(line, "%d (%" SCNbjid ".%d.%d) %d/%d %d:%d:%d", &type, &jobid, &proc, &subproc, &tm.tm_mon, &tm.tm_mday, &tm.tm_hour, &tm.tm_min, &tm.tm_sec) == 9) {
-				tm.tm_year = 2008 - 1900;
+			/*
+				HTCondor job log lines come in one of two flavors:
+
+					005 (312.000.000) 2020-03-28 23:01:04
+				or
+
+					005 (312.000.000) 03/28 23:01:02
+			*/
+			tm.tm_year = current_year;
+
+			if((sscanf(line, "%d (%" SCNbjid ".%d.%d) %d/%d %d:%d:%d",
+					&type, &jobid, &proc, &subproc, &tm.tm_mon, &tm.tm_mday, &tm.tm_hour, &tm.tm_min, &tm.tm_sec) == 9) ||
+				(sscanf(line, "%d (%" SCNbjid ".%d.%d) %d-%d-%d %d:%d:%d",
+					&type, &jobid, &proc, &subproc, &tm.tm_year, &tm.tm_mon, &tm.tm_mday, &tm.tm_hour, &tm.tm_min, &tm.tm_sec) == 10)) {
+
+				tm.tm_year = tm.tm_year - 1900;
 				tm.tm_isdst = 0;
 
 				current = mktime(&tm);

@@ -40,6 +40,7 @@ typedef enum {
 	BATCH_QUEUE_TYPE_SGE,	              /**< Batch jobs will be sent to Sun Grid Engine. */
 	BATCH_QUEUE_TYPE_MOAB,                /**< Batch jobs will be sent to the Moab Workload Manager. */
 	BATCH_QUEUE_TYPE_PBS,                 /**< Batch jobs will be send to the PBS Scheduler. */
+	BATCH_QUEUE_TYPE_LSF,		      /**< Batch jobs will be sent to LSF. */
 	BATCH_QUEUE_TYPE_TORQUE,              /**< Batch jobs will be send to the Torque Scheduler. */
 	BATCH_QUEUE_TYPE_BLUE_WATERS,         /**< Batch jobs will be send to the Torque Scheduler at Blue Waters. */
 	BATCH_QUEUE_TYPE_SLURM,               /**< Batch jobs will be send to the SLURM Scheduler. */
@@ -58,10 +59,12 @@ struct batch_job_info {
 	time_t submitted;    /**< Time the job was submitted to the system. */
 	time_t started;      /**< Time the job actually began executing. */
 	time_t finished;     /**< Time at which the job actually completed. */
+	time_t heartbeat;    /**< Time the job last wrote heartbeat. (only for batch_job_cluster) */
 	int exited_normally; /**< Non-zero if the job ran to completion, zero otherwise. */
 	int exit_code;       /**< The result code of the job, if it exited normally. */
 	int exit_signal;     /**< The signal by which the job was killed, if it exited abnormally. */
 	int disk_allocation_exhausted; /**< Non-zero if the job filled its loop device allocation to capacity, zero otherwise */
+	long log_pos;        /**< Last read position in the log file, for ftell and fseek. (only for batch_job_cluster) */
 };
 
 /** Create a new batch_job_info struct.
@@ -179,7 +182,7 @@ system.
 */
 void batch_queue_set_feature(struct batch_queue *q, const char *what, const char *value);
 
-/** As @batch_queue_set_option, but allowing an integer argument.
+/** As @ref batch_queue_set_option, but allowing an integer argument.
 @param q The batch queue to adjust.
 @param what The key for option.
 @param value The value of the option.
@@ -194,6 +197,13 @@ time a job is submitted.
 @return The option value.
 */
 const char *batch_queue_get_option(struct batch_queue *q, const char *what);
+
+/** Check if option is set to yes
+@param q The batch queue.
+@param what The option key.
+@return 1 if option is yes, 0 if unset or not set to yes.
+*/
+int batch_queue_option_is_yes (struct batch_queue *q, const char *what);
 
 /** Get batch queue feature.
 This call returns a valid const char if the feaute specified is

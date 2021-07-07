@@ -84,13 +84,14 @@ static char *project_regex = 0;
 static char *submission_regex = 0;
 static char *foremen_regex = 0;
 
-char *master_host = 0;
-int master_port = 0;
+char *manager_host = 0;
+int manager_port = 0;
 int using_catalog = 0;
 
 static char *extra_worker_args=0;
 static char *resource_args=0;
 static int abort_flag = 0;
+static pid_t initial_ppid = 0;
 static const char *scratch_dir = 0;
 static const char *password_file = 0;
 static char *config_file = 0;
@@ -100,6 +101,8 @@ static char *batch_submit_options = NULL;
 
 static char *wrapper_command = 0;
 static char *wrapper_input = 0;
+struct jx   *wrapper_inputs = 0;
+
 static char *worker_command = 0;
 
 static char *runos_os = 0;
@@ -132,21 +135,24 @@ static void ignore_signal( int sig )
 {
 }
 
-int master_workers_capacity(struct jx *j) {
+int manager_workers_capacity(struct jx *j) {
 	int capacity_tasks   = jx_lookup_integer(j, "capacity_tasks");
 	int capacity_cores   = jx_lookup_integer(j, "capacity_cores");
 	int capacity_memory  = jx_lookup_integer(j, "capacity_memory");
 	int capacity_disk    = jx_lookup_integer(j, "capacity_disk");
+	int capacity_gpus    = jx_lookup_integer(j, "capacity_gpus");
 	int capacity_weighted = jx_lookup_integer(j, "capacity_weighted");
 
 	const int cores = resources->cores;
 	const int memory = resources->memory;
 	const int disk = resources->disk;
+	const int gpus = resources->gpus;
 
 	debug(D_WQ, "capacity_tasks: %d", capacity_tasks);
 	debug(D_WQ, "capacity_cores: %d", capacity_cores);
 	debug(D_WQ, "capacity_memory: %d", capacity_memory);
 	debug(D_WQ, "capacity_disk: %d", capacity_disk);
+	debug(D_WQ, "capacity_gpus: %d", capacity_gpus);
 
 	// first, assume one task per worker
 	int capacity = capacity_tasks;
@@ -173,17 +179,23 @@ int master_workers_capacity(struct jx *j) {
 		capacity = MIN(capacity, DIV_INT_ROUND_UP(capacity_disk, disk));
 	}
 
+	if(gpus > 0 && capacity_gpus > 0) {
+		capacity = MIN(capacity, DIV_INT_ROUND_UP(capacity_gpus, gpus));
+	}
+
 	return capacity;
 }
 
-int master_workers_needed_by_resource(struct jx *j) {
+int manager_workers_needed_by_resource(struct jx *j) {
 	int tasks_total_cores  = jx_lookup_integer(j, "tasks_total_cores");
 	int tasks_total_memory = jx_lookup_integer(j, "tasks_total_memory");
 	int tasks_total_disk   = jx_lookup_integer(j, "tasks_total_disk");
+	int tasks_total_gpus   = jx_lookup_integer(j, "tasks_total_gpus");
 
 	const int cores = resources->cores;
 	const int memory = resources->memory;
 	const int disk = resources->disk;
+	const int gpus = resources->gpus;
 
 	int needed = 0;
 
@@ -199,27 +211,31 @@ int master_workers_needed_by_resource(struct jx *j) {
 		needed = MAX(needed, DIV_INT_ROUND_UP(tasks_total_disk, disk));
 	}
 
+	if(gpus > 0 && tasks_total_gpus > 0) {
+		needed = MAX(needed, DIV_INT_ROUND_UP(tasks_total_gpus, gpus));
+	}
+
 	return needed;
 }
 
-struct list* do_direct_query( const char *master_host, int master_port )
+struct list* do_direct_query( const char *manager_host, int manager_port )
 {
 	const char * query_string = "queue";
 
 	struct link *l;
 
-	char master_addr[LINK_ADDRESS_MAX];
+	char manager_addr[LINK_ADDRESS_MAX];
 
 	time_t stoptime = time(0) + work_queue_status_timeout;
 
-	if(!domain_name_cache_lookup(master_host,master_addr)) {
-		fprintf(stderr,"couldn't find address of %s\n",master_host);
+	if(!domain_name_cache_lookup(manager_host,manager_addr)) {
+		fprintf(stderr,"couldn't find address of %s\n",manager_host);
 		return 0;
 	}
 
-	l = link_connect(master_addr,master_port,stoptime);
+	l = link_connect(manager_addr,manager_port,stoptime);
 	if(!l) {
-		fprintf(stderr,"couldn't connect to %s port %d: %s\n",master_host,master_port,strerror(errno));
+		fprintf(stderr,"couldn't connect to %s port %d: %s\n",manager_host,manager_port,strerror(errno));
 		return 0;
 	}
 
@@ -229,29 +245,29 @@ struct list* do_direct_query( const char *master_host, int master_port )
 	link_close(l);
 
 	if(!jarray || jarray->type!=JX_ARRAY || !jarray->u.items ) {
-		fprintf(stderr,"couldn't read %s status from %s port %d\n",query_string,master_host,master_port);
+		fprintf(stderr,"couldn't read %s status from %s port %d\n",query_string,manager_host,manager_port);
 		return 0;
 	}
 
 	struct jx *j = jarray->u.items->value;
 	j->type = JX_OBJECT;
 	
-	struct list* master_list = list_create();
-	list_push_head(master_list, j);
-	return master_list;
+	struct list* manager_list = list_create();
+	list_push_head(manager_list, j);
+	return manager_list;
 }
 
-static int count_workers_connected( struct list *masters_list )
+static int count_workers_connected( struct list *managers_list )
 {
 	int connected_workers=0;
 	struct jx *j;
 
-	if(!masters_list) {
+	if(!managers_list) {
 		return connected_workers;
 	}
 
-	list_first_item(masters_list);
-	while((j=list_next_item(masters_list))) {
+	list_first_item(managers_list);
+	while((j=list_next_item(managers_list))) {
 		const int workers = jx_lookup_integer(j,"workers");
 		connected_workers += workers;
 	}
@@ -260,22 +276,22 @@ static int count_workers_connected( struct list *masters_list )
 }
 
 /*
-Count up the workers needed in a given list of masters, IGNORING how many
+Count up the workers needed in a given list of managers, IGNORING how many
 workers are actually connected.
 */
 
-static int count_workers_needed( struct list *masters_list, int only_not_running )
+static int count_workers_needed( struct list *managers_list, int only_not_running )
 {
 	int needed_workers=0;
-	int masters=0;
+	int managers=0;
 	struct jx *j;
 
-	if(!masters_list) {
+	if(!managers_list) {
 		return needed_workers;
 	}
 
-	list_first_item(masters_list);
-	while((j=list_next_item(masters_list))) {
+	list_first_item(managers_list);
+	while((j=list_next_item(managers_list))) {
 
 		const char *project =jx_lookup_string(j,"project");
 		const char *host =   jx_lookup_string(j,"name");
@@ -285,7 +301,7 @@ static int count_workers_needed( struct list *masters_list, int only_not_running
 		const int tw =       jx_lookup_integer(j,"tasks_waiting");
 		const int tl =       jx_lookup_integer(j,"tasks_left");
 
-		int capacity = master_workers_capacity(j);
+		int capacity = manager_workers_capacity(j);
 
 		// first assume one task per worker
 		int need;
@@ -302,7 +318,7 @@ static int count_workers_needed( struct list *masters_list, int only_not_running
 		}
 
 		// consider if tasks declared resources...
-		need = MAX(need, master_workers_needed_by_resource(j));
+		need = MAX(need, manager_workers_needed_by_resource(j));
 
 		if(consider_capacity && capacity > 0) {
 			need = MIN(need, capacity);
@@ -310,7 +326,7 @@ static int count_workers_needed( struct list *masters_list, int only_not_running
 
 		debug(D_WQ,"%s %s:%d %s tasks: %d capacity: %d workers needed: %d tasks running: %d",project,host,port,owner,tw+tl+tr,capacity,need,tr);
 		needed_workers += need;
-		masters++;
+		managers++;
 	}
 
 	return needed_workers;
@@ -322,18 +338,27 @@ static void set_worker_resources_options( struct batch_queue *queue )
 	buffer_init(&b);
 
 	if(batch_queue_get_type(queue) == BATCH_QUEUE_TYPE_CONDOR) {
+		// HTCondor has the ability to fill in, at placement time
+		// Doing it this way enables the --autosize feature, making the worker fit the selected slot
 		buffer_printf(&b, " --cores=$$([TARGET.Cpus]) --memory=$$([TARGET.Memory]) --disk=$$([TARGET.Disk/1024])");
+		if(resources->gpus>0) {
+			buffer_printf(&b," --gpus=$$([TARGET.GPUs])");
+		}
 	} else {
 		if(resources->cores > -1) {
-			buffer_printf(&b, " --cores=%" PRId64, resources->cores);
+			buffer_printf(&b, " --cores=%s", rmsummary_resource_to_str("cores", resources->cores, 0));
 		}
 
 		if(resources->memory > -1) {
-			buffer_printf(&b, " --memory=%" PRId64, resources->memory);
+			buffer_printf(&b, " --memory=%s", rmsummary_resource_to_str("memory", resources->memory, 0));
 		}
 
 		if(resources->disk > -1) {
-			buffer_printf(&b, " --disk=%" PRId64, resources->disk);
+			buffer_printf(&b, " --disk=%s", rmsummary_resource_to_str("disk", resources->disk, 0));
+		}
+
+		if(resources->gpus > -1) {
+			buffer_printf(&b, " --gpus=%s", rmsummary_resource_to_str("gpus", resources->gpus, 0));
 		}
 	}
 
@@ -370,8 +395,8 @@ static int submit_worker( struct batch_queue *queue )
 		cmd = string_format(
 		"%s %s %d -t %d -C '%s' -d all -o worker.log %s %s %s",
 		worker,
-		master_host,
-		master_port,
+		manager_host,
+		manager_port,
 		worker_timeout,
 		catalog_host,
 		password_file ? "-P pwfile" : "",
@@ -434,9 +459,9 @@ static int submit_worker( struct batch_queue *queue )
 	return status;
 }
 
-static void update_blacklisted_workers( struct batch_queue *queue, struct list *masters_list ) {
+static void update_blocked_hosts( struct batch_queue *queue, struct list *managers_list ) {
 
-	if(!masters_list || list_size(masters_list) < 1)
+	if(!managers_list || list_size(managers_list) < 1)
 		return;
 
 	buffer_t b;
@@ -445,22 +470,22 @@ static void update_blacklisted_workers( struct batch_queue *queue, struct list *
 	buffer_init(&b);
 
 	const char *sep = "";
-	list_first_item(masters_list);
-	while((j=list_next_item(masters_list))) {
-		struct jx *blacklisted = jx_lookup(j,"workers_blacklisted");
+	list_first_item(managers_list);
+	while((j=list_next_item(managers_list))) {
+		struct jx *blocked = jx_lookup(j,"workers_blocked");
 
-		if(!blacklisted) {
+		if(!blocked) {
 			continue;
 		}
 
-		if(jx_istype(blacklisted, JX_STRING)) {
-			buffer_printf(&b, "%s%s", sep, blacklisted->u.string_value);
+		if(jx_istype(blocked, JX_STRING)) {
+			buffer_printf(&b, "%s%s", sep, blocked->u.string_value);
 			sep = " ";
 		}
 
-		if(jx_istype(blacklisted, JX_ARRAY)) {
+		if(jx_istype(blocked, JX_ARRAY)) {
 			struct jx *item;
-			for (void *i = NULL; (item = jx_iterate_array(blacklisted, &i));) {
+			for (void *i = NULL; (item = jx_iterate_array(blocked, &i));) {
 				if(jx_istype(item, JX_STRING)) {
 					buffer_printf(&b, "%s%s", sep, item->u.string_value);
 					sep = " ";
@@ -470,9 +495,9 @@ static void update_blacklisted_workers( struct batch_queue *queue, struct list *
 	}
 
 	if(buffer_pos(&b) > 0) {
-		batch_queue_set_option(queue, "workers-blacklisted", buffer_tostring(&b));
+		batch_queue_set_option(queue, "workers-blocked", buffer_tostring(&b));
 	} else {
-		batch_queue_set_option(queue, "workers-blacklisted", NULL);
+		batch_queue_set_option(queue, "workers-blocked", NULL);
 	}
 
 	buffer_free(&b);
@@ -533,7 +558,7 @@ void print_stats(struct jx *j) {
 
 	jx_table_print_header(queue_headers,stdout,columns);
 
-	struct jx *a = jx_lookup(j, "masters");
+	struct jx *a = jx_lookup(j, "managers");
 	if(a) {
 		struct jx *m;
 		for (void *i = NULL; (m = jx_iterate_array(a, &i));) {
@@ -553,7 +578,7 @@ void print_stats(struct jx *j) {
 	fflush(stdout);
 }
 
-struct jx *master_to_jx(struct jx *m) {
+struct jx *manager_to_jx(struct jx *m) {
 
 	struct jx *j = jx_object(NULL);
 
@@ -562,13 +587,13 @@ struct jx *master_to_jx(struct jx *m) {
 	if(project_name) {
 		jx_insert_string(j, "project", jx_lookup_string(m, "project"));
 	} else {
-		jx_insert_string(j, "project", master_host);
+		jx_insert_string(j, "project", manager_host);
 	}
 
 	if(using_catalog) {
 		jx_insert_string(j, "name", jx_lookup_string(m, "name"));
 	} else {
-		jx_insert_string(j, "name", master_host);
+		jx_insert_string(j, "name", manager_host);
 	}
 
 	jx_insert_integer(j, "port",           jx_lookup_integer(m, "port"));
@@ -580,7 +605,7 @@ struct jx *master_to_jx(struct jx *m) {
 	return j;
 }
 
-struct jx *factory_to_jx(struct list *masters, struct list *foremen, int submitted, int needed, int requested, int connected) {
+struct jx *factory_to_jx(struct list *managers, struct list *foremen, int submitted, int needed, int requested, int connected) {
 
 	struct jx *j= jx_object(NULL);
 	jx_insert_string(j, "type", "wq_factory");
@@ -602,16 +627,16 @@ struct jx *factory_to_jx(struct list *masters, struct list *foremen, int submitt
 	jx_insert_integer(j, "workers_to_connect", to_connect);
 
 	struct jx *ms = jx_array(NULL);
-	if(masters && list_size(masters) > 0)
+	if(managers && list_size(managers) > 0)
 	{
 		struct jx *m;
-		list_first_item(masters);
-		while((m = list_next_item(masters)))
+		list_first_item(managers);
+		while((m = list_next_item(managers)))
 		{
-			jx_array_append(ms, master_to_jx(m));
+			jx_array_append(ms, manager_to_jx(m));
 		}
 	}
-	jx_insert(j, jx_string("masters"), ms);
+	jx_insert(j, jx_string("managers"), ms);
 
 
 	struct jx *fs = jx_array(NULL);
@@ -621,7 +646,7 @@ struct jx *factory_to_jx(struct list *masters, struct list *foremen, int submitt
 		list_first_item(foremen);
 		while((f = list_next_item(foremen)))
 		{
-			jx_array_append(fs, master_to_jx(f));
+			jx_array_append(fs, manager_to_jx(f));
 
 		}
 	}
@@ -685,8 +710,9 @@ int read_config_file(const char *config_file) {
 	assign_new_value(new_worker_timeout, worker_timeout, timeout, int, JX_INTEGER, integer_value)
 
 	assign_new_value(new_num_cores_option, resources->cores, cores,    int, JX_INTEGER, integer_value)
-	assign_new_value(new_num_disk_option,  resources->disk, disk,      int, JX_INTEGER, integer_value)
 	assign_new_value(new_num_memory_option, resources->memory, memory, int, JX_INTEGER, integer_value)
+	assign_new_value(new_num_disk_option,  resources->disk, disk,      int, JX_INTEGER, integer_value)
+	assign_new_value(new_num_gpus_option, resources->gpus, gpus,       int, JX_INTEGER, integer_value)
 
 	assign_new_value(new_autosize_option, autosize, autosize, int, JX_INTEGER, integer_value)
 
@@ -694,20 +720,24 @@ int read_config_file(const char *config_file) {
 
 	assign_new_value(new_tasks_per_worker, tasks_per_worker, tasks-per-worker, double, JX_INTEGER, integer_value)
 
-	assign_new_value(new_project_regex, project_regex, master-name, const char *, JX_STRING, string_value)
+	/* first try with old master option, then with manager */
+	assign_new_value(new_project_regex_old_opt, project_regex, master-name, const char *, JX_STRING, string_value)
+	assign_new_value(new_project_regex, project_regex, manager-name, const char *, JX_STRING, string_value)
+
 	assign_new_value(new_foremen_regex, foremen_regex, foremen-name, const char *, JX_STRING, string_value)
 	assign_new_value(new_extra_worker_args, extra_worker_args, worker-extra-options, const char *, JX_STRING, string_value)
 
 	assign_new_value(new_condor_requirements, condor_requirements, condor-requirements, const char *, JX_STRING, string_value)
 
-	if(!new_project_regex || strlen(new_project_regex) == 0) {
-		debug(D_NOTICE, "%s: master name is missing.\n", config_file);
-		error_found = 1;
-	}
-
-	if(new_workers_min > new_workers_max) {
-		debug(D_NOTICE, "%s: min workers (%d) is greater than max workers (%d)\n", config_file, new_workers_min, new_workers_max);
-		error_found = 1;
+	if(!manager_host) {
+		if(!new_project_regex) {
+			// if manager-name not given, try with the old master-name
+			new_project_regex = new_project_regex_old_opt;
+		}
+		if(!new_project_regex || strlen(new_project_regex) == 0) {
+			debug(D_NOTICE, "%s: manager name is missing and no manager host was given.\n", config_file);
+			error_found = 1;
+		}
 	}
 
 	if(new_workers_min < 0) {
@@ -715,10 +745,17 @@ int read_config_file(const char *config_file) {
 		error_found = 1;
 	}
 
-	if(new_workers_max < 0) {
-		debug(D_NOTICE, "%s: max workers (%d) is less than zero.\n", config_file, new_workers_max);
+	if(new_workers_max < 1) {
+		debug(D_NOTICE, "%s: max workers (%d) is less than one.\n", config_file, new_workers_max);
 		error_found = 1;
 	}
+
+	if(new_workers_min > new_workers_max) {
+		debug(D_NOTICE, "%s: min workers (%d) is greater than max workers (%d)\n", config_file, new_workers_min, new_workers_max);
+		debug(D_NOTICE, "setting min workers and max workers to %d\n", new_workers_max);
+		new_workers_min = new_workers_max;
+	}
+
 
 	if(new_factory_timeout_option < 0) {
 		debug(D_NOTICE, "%s: factory timeout (%d) is less than zero.\n", config_file, new_factory_timeout_option);
@@ -741,6 +778,7 @@ int read_config_file(const char *config_file) {
 	resources->cores  = new_num_cores_option;
 	resources->memory = new_num_memory_option;
 	resources->disk   = new_num_disk_option;
+	resources->gpus   = new_num_gpus_option;
 
 	if(tasks_per_worker < 1) {
 		tasks_per_worker = resources->cores > 0 ? resources->cores : 1;
@@ -769,7 +807,7 @@ int read_config_file(const char *config_file) {
 	last_time_modified = new_time_modified;
 	fprintf(stdout, "Configuration file '%s' has been loaded.", config_file);
 
-	fprintf(stdout, "master-name: %s\n", project_regex);
+	fprintf(stdout, "manager-name: %s\n", project_regex);
 	if(foremen_regex) {
 		fprintf(stdout, "foremen-name: %s\n", foremen_regex);
 	}
@@ -777,9 +815,9 @@ int read_config_file(const char *config_file) {
 	fprintf(stdout, "min-workers: %d\n", workers_min);
 	fprintf(stdout, "workers-per-cycle: %d\n", workers_per_cycle);
 
-	fprintf(stdout, "tasks-per-worker: %" PRId64 "\n", tasks_per_worker > 0 ? tasks_per_worker : (resources->cores > 0 ? resources->cores : 1));
+	fprintf(stdout, "tasks-per-worker: %d\n", tasks_per_worker > 0 ? tasks_per_worker : (resources->cores > 0 ? (int) resources->cores : 1));
 	fprintf(stdout, "timeout: %d s\n", worker_timeout);
-	fprintf(stdout, "cores: %" PRId64 "\n", resources->cores > 0 ? resources->cores : 1);
+	fprintf(stdout, "cores: %s\n", rmsummary_resource_to_str("cores", resources->cores > 0 ? resources->cores : 1, 0));
 
 	if(condor_requirements) {
 		fprintf(stdout, "condor-requirements: %s\n", condor_requirements);
@@ -790,11 +828,15 @@ int read_config_file(const char *config_file) {
 	}
 
 	if(resources->memory > -1) {
-		fprintf(stdout, "memory: %" PRId64 " MB\n", resources->memory);
+		fprintf(stdout, "memory: %s\n", rmsummary_resource_to_str("memory", resources->memory, 1));
 	}
 
 	if(resources->disk > -1) {
-		fprintf(stdout, "disk: %" PRId64 " MB\n", resources->disk);
+		fprintf(stdout, "disk: %s\n", rmsummary_resource_to_str("disk", resources->disk, 1));
+	}
+
+	if(resources->gpus > -1) {
+		fprintf(stdout, "gpus: %s\n", rmsummary_resource_to_str("gpus", resources->gpus, 0));
 	}
 
 	if(extra_worker_args) {
@@ -810,7 +852,7 @@ end:
 
 /*
 Main loop of work queue pool.  Determine the number of workers needed by our
-current list of masters, compare it to the number actually submitted, then
+current list of managers, compare it to the number actually submitted, then
 submit more until the desired state is reached.
 */
 
@@ -819,12 +861,17 @@ static void mainloop( struct batch_queue *queue )
 	int workers_submitted = 0;
 	struct itable *job_table = itable_create(0);
 
-	struct list *masters_list = NULL;
+	struct list *managers_list = NULL;
 	struct list *foremen_list = NULL;
 
 	int64_t factory_timeout_start = time(0);
 
 	while(!abort_flag) {
+		if (initial_ppid != 0 && getppid() != initial_ppid) {
+			printf("parent process exited, shutting down\n");
+			abort_flag = 1;
+			break;
+		}
 
 		if(config_file && !read_config_file(config_file)) {
 			debug(D_NOTICE, "Error re-reading '%s'. Using previous values.", config_file);
@@ -836,13 +883,13 @@ static void mainloop( struct batch_queue *queue )
 		submission_regex = foremen_regex ? foremen_regex : project_regex;
 
 		if(using_catalog) {
-			masters_list = work_queue_catalog_query(catalog_host,-1,project_regex);
+			managers_list = work_queue_catalog_query(catalog_host,-1,project_regex);
 		}
 		else {
-			masters_list = do_direct_query(master_host,master_port);
+			managers_list = do_direct_query(manager_host,manager_port);
 		}
 
-		if(masters_list && list_size(masters_list) > 0)
+		if(managers_list && list_size(managers_list) > 0)
 		{
 			factory_timeout_start = time(0);
 		} else {
@@ -850,23 +897,23 @@ static void mainloop( struct batch_queue *queue )
 			if(factory_timeout > 0)
 			{
 				if(time(0) - factory_timeout_start > factory_timeout) {
-					fprintf(stderr, "There have been no masters for longer then the factory timeout, exiting\n");
+					fprintf(stderr, "There have been no managers for longer then the factory timeout, exiting\n");
 					abort_flag=1;
 					break;
 				}
 			}
 		}
 	
-		debug(D_WQ,"evaluating master list...");
-		int workers_connected = count_workers_connected(masters_list);
+		debug(D_WQ,"evaluating manager list...");
+		int workers_connected = count_workers_connected(managers_list);
 		int workers_needed = 0;
 
 		if(foremen_regex)
 		{
 			/* If there are foremen, we only look at tasks not running in the
-			 * masters' list. The rest of the tasks will be counted as waiting
+			 * managers' list. The rest of the tasks will be counted as waiting
 			 * or running on the foremen. */
-			workers_needed = count_workers_needed(masters_list, /* do not count running tasks */ 1);
+			workers_needed = count_workers_needed(managers_list, /* do not count running tasks */ 1);
 			debug(D_WQ,"evaluating foremen list...");
 			foremen_list    = work_queue_catalog_query(catalog_host,-1,foremen_regex);
 
@@ -878,12 +925,12 @@ static void mainloop( struct batch_queue *queue )
 			debug(D_WQ,"%d total workers needed across %d foremen",workers_needed,list_size(foremen_list));
 		} else {
 			/* If there are no foremen, workers needed are computed directly
-			 * from the tasks running, waiting, and left from the masters'
+			 * from the tasks running, waiting, and left from the managers'
 			 * list. */
-			workers_needed = count_workers_needed(masters_list, 0);
-			debug(D_WQ,"%d total workers needed across %d masters",
+			workers_needed = count_workers_needed(managers_list, 0);
+			debug(D_WQ,"%d total workers needed across %d managers",
 					workers_needed,
-					masters_list ? list_size(masters_list) : 0);
+					managers_list ? list_size(managers_list) : 0);
 		}
 
 		debug(D_WQ,"raw workers needed: %d", workers_needed);
@@ -929,7 +976,7 @@ static void mainloop( struct batch_queue *queue )
 		debug(D_WQ,"workers submitted: %d", workers_submitted);
 		debug(D_WQ,"workers requested: %d", MAX(0, new_workers_needed));
 
-		struct jx *j = factory_to_jx(masters_list, foremen_list, workers_submitted, workers_needed, new_workers_needed, workers_connected);
+		struct jx *j = factory_to_jx(managers_list, foremen_list, workers_submitted, workers_needed, new_workers_needed, workers_connected);
 
 		char *update_str = jx_print_string(j);
 		debug(D_WQ, "Sending status to the catalog server(s) at %s ...", catalog_host);
@@ -938,7 +985,7 @@ static void mainloop( struct batch_queue *queue )
 		free(update_str);
 		jx_delete(j);
 
-		update_blacklisted_workers(queue, masters_list);
+		update_blocked_hosts(queue, managers_list);
 
 		if(new_workers_needed > 0) {
 			debug(D_WQ,"submitting %d new workers to reach target",new_workers_needed);
@@ -969,10 +1016,17 @@ static void mainloop( struct batch_queue *queue )
 			}
 		}
 
-		delete_projects_list(masters_list);
+		delete_projects_list(managers_list);
 		delete_projects_list(foremen_list);
 
-		sleep(factory_period);
+		int sleep_seconds = 0;
+		while(sleep_seconds < factory_period) {
+			if(abort_flag) {
+				break;
+			}
+			sleep_seconds += 1;
+			sleep(1);
+		}
 	}
 
 	printf("removing %d workers...\n",itable_size(job_table));
@@ -981,50 +1035,94 @@ static void mainloop( struct batch_queue *queue )
 	itable_delete(job_table);
 }
 
+/* Add a wrapper command around the worker executable. */
+/* Note that multiple wrappers can be nested. */
+
+void add_wrapper_command( const char *cmd )
+{
+	if(!wrapper_command) {
+		wrapper_command = strdup(cmd);
+	} else {
+		char *tmp = string_format("%s %s",cmd,wrapper_command);
+		free(wrapper_command);
+		wrapper_command = tmp;
+	}
+}
+
+/* Add an additional input file to be consumed by the wrapper. */
+
+void add_wrapper_input( const char *filename )
+{
+	if(!wrapper_input) {
+		wrapper_input = strdup(filename);
+	} else {
+		char *tmp = string_format("%s,%s",wrapper_input,filename);
+		free(wrapper_command);
+		wrapper_command = tmp;
+	}
+	struct jx *file = jx_string(filename);
+	jx_array_append(wrapper_inputs, file);
+}
+
 static void show_help(const char *cmd)
 {
-	printf("Use: work_queue_factory [options] <masterhost> <port>\nor\n     work_queue_factory [options] -M projectname\n");
-	printf("where options are:\n");
-	printf(" %-30s Project name of masters to serve, can be a regular expression.\n", "-M,-N,--master-name=<project>");\
-	printf(" %-30s Foremen to serve, can be a regular expression.\n", "-F,--foremen-name=<project>");
-	printf(" %-30s Catalog server to query for masters (default: %s:%d).\n", "--catalog=<host:port>",CATALOG_HOST,CATALOG_PORT);
-	printf(" %-30s Batch system type (required). One of:\n", "-T,--batch-type=<type>");
-	printf(" %-30s %s\n","",batch_queue_type_string());
-	printf(" %-30s Add these options to all batch submit files.\n", "-B,--batch-options=<options>");
-	printf(" %-30s Password file for workers to authenticate to master.\n","-P,--password");
+	printf("Use: work_queue_factory [options] <managerhost> <port>\n");
+	printf("Or:  work_queue_factory [options] -M projectname\n");
+	printf("\n");
+	/*------------------------------------------------------------*/
+	printf("General options:\n");
+	printf(" %-30s Batch system type (required). One of: %s\n", "-T,--batch-type=<type>",batch_queue_type_string());
 	printf(" %-30s Use configuration file <file>.\n","-C,--config-file=<file>");
-	printf(" %-30s Minimum workers running (default=%d).\n", "-w,--min-workers", workers_min);
-	printf(" %-30s Maximum workers running (default=%d).\n", "-W,--max-workers", workers_max);
-	printf(" %-30s Maximum number of new workers per %d s (less than 1 disables limit, default=%d).\n", "--workers-per-cycle", factory_period, workers_per_cycle);
-	printf(" %-30s Average tasks per worker (default=one task per core).\n", "--tasks-per-worker");
-	printf(" %-30s Workers abort after this amount of idle time (default=%d).\n", "-t,--timeout=<time>",worker_timeout);
-	printf(" %-30s Environment variable that should be added to the worker (May be specified multiple times).\n", "--env=<variable=value>");
-	printf(" %-30s Extra options that should be added to the worker.\n", "-E,--extra-options=<options>");
-	printf(" %-30s Set the number of cores requested per worker.\n", "--cores=<n>");
-	printf(" %-30s Set the number of GPUs requested per worker.\n", "--gpus=<n>");
-	printf(" %-30s Set the amount of memory (in MB) requested per worker.\n", "--memory=<mb>           ");
-	printf(" %-30s Set the amount of disk (in MB) requested per worker.\n", "--disk=<mb>");
-	printf(" %-30s Automatically size a worker to an available slot (Condor, Mesos, and Kubernetes).\n", "--autosize");
-	printf(" %-30s Set requirements for the workers as Condor jobs. May be specified several times with expresions and-ed together (Condor only).\n", "--condor-requirements");
-	printf(" %-30s Exit after no master has been seen in <n> seconds.\n", "--factory-timeout");
-	printf(" %-30s Use this scratch dir for temporary files (default is /tmp/wq-pool-$uid).\n","-S,--scratch-dir");
-	printf(" %-30s Use worker capacity reported by masters.\n","-c,--capacity");
+	printf(" %-30s Project name of managers to server, can be regex\n","-M,-N,--manager-name=<project>");\
+	printf(" %-30s Foremen to serve, can be a regular expression.\n", "-F,--foremen-name=<project>");
+	printf(" %-30s Catalog server to query for managers.\n", "--catalog=<host:port>");
+	printf(" %-30s Password file for workers to authenticate.\n","-P,--password");
+	printf(" %-30s Use this scratch dir for factory.\n","-S,--scratch-dir");
+	printf(" %-30s (default: /tmp/wq-factory-$uid).\n","");
+	printf(" %-30s Force factory to run itself as a manager.\n","--run-factory-as-manager");
+	printf(" %-30s Exit if parent process dies.\n", "--parent-death");
 	printf(" %-30s Enable debugging for this subsystem.\n", "-d,--debug=<subsystem>");
-	printf(" %-30s Specify Amazon config file (for use with -T amazon).\n", "--amazon-config");
-	printf(" %-30s Wrap factory with this command prefix.\n","--wrapper");
-	printf(" %-30s Add this input file needed by the wrapper.\n","--wrapper-input");
-	printf(" %-30s Specify the host name to mesos master node (for use with -T mesos).\n", "--mesos-master");
-	printf(" %-30s Specify path to mesos python library (for use with -T mesos).\n", "--mesos-path");
-	printf(" %-30s Specify the linking libraries for running mesos (for use with -T mesos).\n", "--mesos-preload");
-	printf(" %-30s Specify the container image for using Kubernetes (for use with -T k8s).\n", "--k8s-image");
-	printf(" %-30s Specify the container image that contains work_queue_worker availabe for using Kubernetes (for use with -T k8s).\n", "--k8s-worker-image");
-	printf(" %-30s Send debugging to this file (can also be :stderr, :stdout, :syslog, or :journal).\n", "-o,--debug-file=<file>");
-	printf(" %-30s Specify the size of the debug file (must use with -o option).\n", "-O,--debug-file-size=<mb>");
-	printf(" %-30s Specify the binary to use for the worker (relative or hard path). It should accept the same arguments as the default work_queue_worker.\n", "--worker-binary=<file>");
-	printf(" %-30s Will make a best attempt to ensure the worker will execute in the specified OS environment, regardless of the underlying OS.\n","--runos=<img>");
-	printf(" %-30s Force factory to run itself as a work queue master.\n","--run-factory-as-master");
+	printf(" %-30s Send debugging to this file.\n", "-o,--debug-file=<file>");
+	printf(" %-30s Specify the size of the debug file.\n", "-O,--debug-file-size=<mb>");
 	printf(" %-30s Show the version string.\n", "-v,--version");
 	printf(" %-30s Show this screen.\n", "-h,--help");
+
+	/*------------------------------------------------------------*/
+	printf("\nConcurrency control options:\n");
+	printf(" %-30s Minimum workers running (default=%d).\n", "-w,--min-workers", workers_min);
+	printf(" %-30s Maximum workers running (default=%d).\n", "-W,--max-workers", workers_max);
+	printf(" %-30s Max number of new workers per %ds (default=%d)\n", "--workers-per-cycle", factory_period, workers_per_cycle);
+	printf(" %-30s Workers abort after idle time (default=%d).\n", "-t,--timeout=<time>",worker_timeout);
+	printf(" %-30s Exit after no manager seen in <n> seconds.\n", "--factory-timeout");
+	printf(" %-30s Average tasks per worker (default=one per core).\n", "--tasks-per-worker");
+	printf(" %-30s Use worker capacity reported by managers.\n","-c,--capacity");
+
+	printf("\nResource management options:\n");
+	printf(" %-30s Set the number of cores requested per worker.\n", "--cores=<n>");
+	printf(" %-30s Set the number of GPUs requested per worker.\n", "--gpus=<n>");
+	printf(" %-30s Set the amount of memory (in MB) per worker.\n", "--memory=<mb>           ");
+	printf(" %-30s Set the amount of disk (in MB) per worker.\n", "--disk=<mb>");
+	printf(" %-30s Autosize worker to slot (Condor, Mesos, K8S).\n", "--autosize");
+
+	printf("\nWorker environment options:\n");
+	printf(" %-30s Environment variable to add to worker.\n", "--env=<variable=value>");
+	printf(" %-30s Extra options to give to worker.\n", "-E,--extra-options=<options>");
+	printf(" %-30s Alternate binary instead of work_queue_worker.\n", "--worker-binary=<file>");
+	printf(" %-30s Wrap factory with this command prefix.\n","--wrapper");
+	printf(" %-30s Add this input file needed by the wrapper.\n","--wrapper-input");
+	printf(" %-30s Use runos tool to create environment (ND only).\n","--runos=<img>");
+	printf(" %-30s Run each worker inside this python package.\n","--python-package");
+
+	printf("\nOptions specific to batch systems:\n");
+	printf(" %-30s Generic batch system options.\n", "-B,--batch-options=<options>");
+	printf(" %-30s Specify Amazon config file.\n", "--amazon-config");
+	printf(" %-30s Set requirements for the workers as Condor jobs.\n", "--condor-requirements");
+	printf(" %-30s Host name of mesos manager node..\n", "--mesos-master");
+	printf(" %-30s Path to mesos python library..\n", "--mesos-path");
+	printf(" %-30s Libraries for running mesos.\n", "--mesos-preload");
+	printf(" %-30s Container image for Kubernetes.\n", "--k8s-image");
+	printf(" %-30s Container image with worker for Kubernetes.\n", "--k8s-worker-image");
+
 }
 
 enum{   LONG_OPT_CORES = 255,
@@ -1041,15 +1139,17 @@ enum{   LONG_OPT_CORES = 255,
 		LONG_OPT_WRAPPER, 
 		LONG_OPT_WRAPPER_INPUT,
 		LONG_OPT_WORKER_BINARY,
-		LONG_OPT_MESOS_MASTER, 
+		LONG_OPT_MESOS_MANAGER, 
 		LONG_OPT_MESOS_PATH,
 		LONG_OPT_MESOS_PRELOAD,
 		LONG_OPT_K8S_IMAGE,
 		LONG_OPT_K8S_WORKER_IMAGE,
 		LONG_OPT_CATALOG,
 		LONG_OPT_ENVIRONMENT_VARIABLE,
-		LONG_OPT_RUN_AS_MASTER,
+		LONG_OPT_RUN_AS_MANAGER,
 		LONG_OPT_RUN_OS,
+		LONG_OPT_PARENT_DEATH,
+		LONG_OPT_PYTHON_PACKAGE,
 	};
 
 static const struct option long_options[] = {
@@ -1074,15 +1174,18 @@ static const struct option long_options[] = {
 	{"help", no_argument, 0, 'h'},
 	{"k8s-image", required_argument, 0, LONG_OPT_K8S_IMAGE},
 	{"k8s-worker-image", required_argument, 0, LONG_OPT_K8S_WORKER_IMAGE},
+	{"manager-name", required_argument, 0, 'M'},
 	{"master-name", required_argument, 0, 'M'},
 	{"max-workers", required_argument, 0, 'W'},
 	{"memory", required_argument,  0,  LONG_OPT_MEMORY},
-	{"mesos-master", required_argument, 0, LONG_OPT_MESOS_MASTER},
+	{"mesos-master", required_argument, 0, LONG_OPT_MESOS_MANAGER},
 	{"mesos-path", required_argument, 0, LONG_OPT_MESOS_PATH},
 	{"mesos-preload", required_argument, 0, LONG_OPT_MESOS_PRELOAD},
 	{"min-workers", required_argument, 0, 'w'},
+	{"parent-death", no_argument, 0, LONG_OPT_PARENT_DEATH},
 	{"password", required_argument, 0, 'P'},
-	{"run-factory-as-master", no_argument, 0, LONG_OPT_RUN_AS_MASTER},
+	{"python-package", required_argument, 0, LONG_OPT_PYTHON_PACKAGE},
+	{"run-factory-as-manager", no_argument, 0, LONG_OPT_RUN_AS_MANAGER},
 	{"runos", required_argument, 0, LONG_OPT_RUN_OS},
 	{"scratch-dir", required_argument, 0, 'S' },
 	{"tasks-per-worker", required_argument, 0, LONG_OPT_TASKS_PER_WORKER},
@@ -1098,14 +1201,15 @@ static const struct option long_options[] = {
 
 int main(int argc, char *argv[])
 {
-	char *mesos_master = NULL;
+	char *mesos_manager = NULL;
 	char *mesos_path = NULL;
 	char *mesos_preload = NULL;
 	char *k8s_image = NULL;
-	struct jx *wrapper_inputs = jx_array(NULL);
 
-	// --run-factory-as-master and -Twq should be used together.
-	int run_as_master = 0;
+	wrapper_inputs = jx_array(NULL);
+
+	// --run-factory-as-manager and -Twq should be used together.
+	int run_as_manager = 0;
 
 	//Environment variable handling
 	char *ev = NULL;
@@ -1212,17 +1316,24 @@ int main(int argc, char *argv[])
 					condor_requirements = string_format("(%s)", optarg);
 				}
 				break;
+			case LONG_OPT_PYTHON_PACKAGE:
+				{
+				// --package X is the equivalent of --wrapper "python_package_run X" --wrapper-input X
+				add_wrapper_command( string_format("./python_package_run -e %s --",optarg) );
+				char *fullpath = path_which("python_package_run");
+				if(!fullpath) {
+					fprintf(stderr,"work_queue_factory: could not find python_package_run in PATH");
+					return 1;
+				}
+				add_wrapper_input(fullpath);
+				add_wrapper_input(optarg);
+				break;
+				}
 			case LONG_OPT_WRAPPER:
-				wrapper_command = optarg;
+				add_wrapper_command(optarg);
 				break;
 			case LONG_OPT_WRAPPER_INPUT:
-				if(!wrapper_input) {
-					wrapper_input = strdup(optarg);
-				} else {
-					wrapper_input = string_format("%s,%s",wrapper_input,optarg);
-				}
-				struct jx *file = jx_string(optarg);
-				jx_array_append(wrapper_inputs, file);
+				add_wrapper_input(optarg);
 				break;
 			case LONG_OPT_WORKER_BINARY:
 				worker_command = xxstrdup(optarg);
@@ -1237,7 +1348,10 @@ int main(int argc, char *argv[])
 				consider_capacity = 1;
 				break;
 			case 'd':
-				debug_flags_set(optarg);
+				if (!debug_flags_set(optarg)) {
+					fprintf(stderr, "Unknown debug flag: %s\n", optarg);
+					exit(EXIT_FAILURE);
+				}
 				break;
 			case 'o':
 				debug_config_file(optarg);
@@ -1251,8 +1365,8 @@ int main(int argc, char *argv[])
 			case 'h':
 				show_help(argv[0]);
 				exit(EXIT_SUCCESS);
-			case LONG_OPT_MESOS_MASTER:
-				mesos_master = xxstrdup(optarg);
+			case LONG_OPT_MESOS_MANAGER:
+				mesos_manager = xxstrdup(optarg);
 				break;
 			case LONG_OPT_MESOS_PATH:
 				mesos_path = xxstrdup(optarg);
@@ -1270,11 +1384,14 @@ int main(int argc, char *argv[])
 			case LONG_OPT_CATALOG:
 				catalog_host = xxstrdup(optarg);
 				break;
-			case LONG_OPT_RUN_AS_MASTER:
-				run_as_master = 1;
+			case LONG_OPT_RUN_AS_MANAGER:
+				run_as_manager = 1;
 				break;
 			case LONG_OPT_RUN_OS:
 				runos_os = xxstrdup(optarg);
+				break;
+			case LONG_OPT_PARENT_DEATH:
+				initial_ppid = getppid();
 				break;
 			default:
 				show_help(argv[0]);
@@ -1282,12 +1399,12 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	if(batch_queue_type == BATCH_QUEUE_TYPE_WORK_QUEUE && !run_as_master) {
+	if(batch_queue_type == BATCH_QUEUE_TYPE_WORK_QUEUE && !run_as_manager) {
 		fprintf(stderr, "work_queue_factory: batch system 'wq' specified, but you most likely want 'local'.\n");
-		fprintf(stderr, "work_queue_factory: use --run-factory-as-master if you know what you are doing.\n");
+		fprintf(stderr, "work_queue_factory: use --run-factory-as-manager if you know what you are doing.\n");
 		exit(EXIT_FAILURE);
-	} else if(batch_queue_type != BATCH_QUEUE_TYPE_WORK_QUEUE && run_as_master) {
-		fprintf(stderr, "work_queue_factory: --run-factory-as-master can only be used with -Twq.\n");
+	} else if(batch_queue_type != BATCH_QUEUE_TYPE_WORK_QUEUE && run_as_manager) {
+		fprintf(stderr, "work_queue_factory: --run-factory-as-manager can only be used with -Twq.\n");
 		fprintf(stderr, "work_queue_factory: you most likely want -Tlocal instead.\n");
 		exit(EXIT_FAILURE);
 	}
@@ -1306,24 +1423,27 @@ int main(int argc, char *argv[])
 		config_file = xxstrdup(abs_path_name);
 	}
 
-	if(project_regex) {
-		using_catalog = 1;
-	} else if(config_file) {
-		using_catalog = 1;
+	if((argc - optind) == 2) {
+		manager_host = argv[optind];
+		manager_port = atoi(argv[optind+1]);
+	}
+
+	if(config_file) {
 		if(!read_config_file(config_file)) {
 			fprintf(stderr,"work_queue_factory: There were errors in the configuration file: %s\n", config_file);
 			return 1;
 		}
 	}
-	else if((argc - optind) == 2) {
-		using_catalog = 0;
-		master_host = argv[optind];
-		master_port = atoi(argv[optind+1]);
-	}
-	else {
-		fprintf(stderr,"work_queue_factory: You must either give a project name with the -M option or master-name option with a configuration file, or give the master's host and port.\n");
-		show_help(argv[0]);
+
+	if(!(manager_host || config_file || project_regex)) {
+		fprintf(stderr,"work_queue_factory: You must either give a project name with the -M option or manager-name option with a configuration file, or give the manager's host and port.\n");
 		exit(1);
+	}
+
+	if(manager_host) {
+		using_catalog = 0;
+	} else {
+		using_catalog = 1;
 	}
 
 	cctools_version_debug(D_DEBUG, argv[0]);
@@ -1361,9 +1481,9 @@ int main(int argc, char *argv[])
 
 	if(!scratch_dir) {
 		if(batch_queue_type==BATCH_QUEUE_TYPE_CONDOR) {
-			scratch_dir = string_format("/tmp/wq-pool-%d",getuid());
+			scratch_dir = string_format("/tmp/wq-factory-%d",getuid());
 		} else {
-			scratch_dir = string_format("wq-pool-%d",getuid());
+			scratch_dir = string_format("wq-factory-%d",getuid());
 		}
 	}
 
@@ -1373,13 +1493,14 @@ int main(int argc, char *argv[])
 	}
 
 	if(wrapper_input) {
-		struct jx *item;
-		for(void *i = NULL; (item = jx_iterate_array(wrapper_inputs, &i));) {
+		struct jx *item=0;
+		for( void *i=0; (item=jx_iterate_array(wrapper_inputs,&i)); ) {
 			const char *value = item->u.string_value;
 			const char *file_at_scratch_dir = string_format("%s/%s", scratch_dir, path_basename(value));
 			int result = copy_direntry(value, file_at_scratch_dir); 
 			if(result < 0) {
-				debug(D_NOTICE, "Cannot copy wrapper input file %s to factory scratch directory", value);
+				fprintf(stderr,"work_queue_factory: Cannot copy wrapper input file %s to factory scratch directory\n", value);
+				exit(EXIT_FAILURE);
 			}
 		}
 	}
@@ -1388,7 +1509,7 @@ int main(int argc, char *argv[])
 	if(worker_command != NULL){
 		cmd = string_format("cp '%s' '%s'",worker_command,scratch_dir);
 		if(system(cmd)){
-			fprintf(stderr, "work_queue_factory: Could not Access specified worker binary.\n");
+			fprintf(stderr,"work_queue_factory: Could not Access specified worker binary.\n");
 			exit(EXIT_FAILURE);
 		}
 		free(cmd);
@@ -1452,7 +1573,7 @@ int main(int argc, char *argv[])
 
 	if(batch_queue_type == BATCH_QUEUE_TYPE_MESOS) {
 		batch_queue_set_option(queue, "mesos-path", mesos_path);
-		batch_queue_set_option(queue, "mesos-master", mesos_master);
+		batch_queue_set_option(queue, "mesos-master", mesos_manager);
 		batch_queue_set_option(queue, "mesos-preload", mesos_preload);
 		batch_queue_set_logfile(queue, "work_queue_factory.mesoslog");
 	}

@@ -17,6 +17,7 @@ SOURCES = \
 	catalog_query.c \
 	category.c \
 	cctools.c \
+	cctools_endian.c \
 	change_process_title.c \
 	chunk.c \
 	clean_dir.c \
@@ -60,7 +61,6 @@ SOURCES = \
 	itable.c \
 	jx.c \
 	jx_binary.c\
-	jx_database.c \
 	jx_getopt.c \
 	jx_match.c \
 	jx_parse.c \
@@ -70,6 +70,7 @@ SOURCES = \
 	jx_table.c \
 	jx_export.c \
 	jx_eval.c \
+	jx_sub.c \
 	jx_function.c \
 	link.c \
 	link_auth.c \
@@ -78,6 +79,7 @@ SOURCES = \
 	md5.c \
 	memfdexe.c \
 	mkdir_recursive.c \
+	mq.c \
 	twister.c \
 	nvpair.c \
 	nvpair_jx.c \
@@ -85,6 +87,7 @@ SOURCES = \
 	path.c \
 	path_disk_size_info.c \
 	pattern.c \
+	ppoll_compat.c \
 	preadwrite.c \
 	process.c \
 	random.c \
@@ -92,7 +95,7 @@ SOURCES = \
 	rmonitor_poll.c \
 	rmsummary.c \
 	set.c \
-    semaphore.c \
+	semaphore.c \
 	sha1.c \
 	shell.c \
 	sh_popen.c\
@@ -107,6 +110,7 @@ SOURCES = \
 	text_list.c \
 	timer.c \
 	timestamp.c \
+	tlq_config.c \
 	unlink_recursive.c \
 	uptime.c \
 	url_encode.c \
@@ -149,6 +153,7 @@ HEADERS_PUBLIC = \
 	load_average.h \
 	md5.h \
 	macros.h \
+	mq.h \
 	path.h \
 	rmonitor_poll.h \
 	rmsummary.h \
@@ -174,18 +179,21 @@ endif
 OBJECTS = $(SOURCES:%.c=%.o)
 
 #separate, because catalog_query has a slightly different order of linking.
-MOST_PROGRAMS = catalog_update catalog_server watchdog disk_allocator jx2json jx2env env_replace
+MOST_PROGRAMS = catalog_update watchdog disk_allocator jx2json jx2env jx_repl env_replace
 PROGRAMS = $(MOST_PROGRAMS) catalog_query
 
 SCRIPTS = cctools_gpu_autodetect
 TARGETS = $(LIBRARIES) $(PRELOAD_LIBRARIES) $(PROGRAMS) $(TEST_PROGRAMS)
-TEST_PROGRAMS = auth_test disk_alloc_test jx_test microbench multirun jx_count_obj_test histogram_test category_test jx_binary_test
+TEST_PROGRAMS = auth_test disk_alloc_test jx_test microbench multirun jx_count_obj_test histogram_test category_test jx_binary_test mq_poll_test mq_wait_test mq_store_test
 
 all: $(TARGETS) catalog_query
 
 libdttools.a: $(OBJECTS)
 
 $(MOST_PROGRAMS) $(TEST_PROGRAMS): libdttools.a
+
+jx_repl: jx_repl.o libdttools.a
+	$(CCTOOLS_LD) -o $@ $(CCTOOLS_INTERNAL_LDFLAGS) $(LOCAL_LDFLAGS) $^ $(LOCAL_LINKAGE) $(CCTOOLS_EXTERNAL_LINKAGE) $(CCTOOLS_READLINE_LDFLAGS)
 
 catalog_query: catalog_query.o catalog_query_tool.o libdttools.a
 

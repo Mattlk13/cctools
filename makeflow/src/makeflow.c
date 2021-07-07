@@ -33,6 +33,7 @@ See the file COPYING for details.
 #include "jx_print.h"
 #include "create_dir.h"
 #include "sha1.h"
+#include "tlq_config.h"
 
 #include "dag.h"
 #include "dag_node.h"
@@ -97,7 +98,7 @@ an example.
 #define MAX_REMOTE_JOBS_DEFAULT 100
 
 /*
-Flags to control the basic behavior of the Makeflow main loop. 
+Flags to control the basic behavior of the Makeflow main loop.
 */
 enum job_submit_status {
 	JOB_SUBMISSION_HOOK_FAILURE = -1,
@@ -129,6 +130,9 @@ static int makeflow_gc_count  = -1;
 static int makeflow_gc_barrier = 1;
 /* Determines next gc_barrier to make checks less frequent with large number of tasks */
 static double makeflow_gc_task_ratio = 0.05;
+
+/* Makeflow current executable*/
+static char makeflow_exe[PATH_MAX];
 
 /*
 Makeflow manages two queues of jobs.
@@ -197,6 +201,12 @@ Would be better implemented as a batch system feature.
 
 extern int batch_job_verbose_jobnames;
 
+/**
+Hack: Disable batch job feature which generates and checks heartbeats.
+*/
+
+extern int batch_job_disable_heartbeat;
+
 /*
 Wait upto this many seconds for an output file of a succesfull task
 to appear on the local filesystem (e.g, to deal with NFS
@@ -219,6 +229,24 @@ server, viewable by the makeflow_status command.
 static int catalog_reporting_on = 0;
 
 /*
+Create a status file about makeflow status
+*/ 
+
+static int file_status_on = 0;
+
+/*
+Store name of file detailing makeflow status.
+Default to status.html
+*/
+static char *file_status_name = "status.html";
+
+/*
+Store time interval for status file update.
+Default to 60s.
+*/
+static unsigned int file_status_interval = 60;
+
+/*
 Options related to the "mounting" of external data
 files at the DAG level.
 */
@@ -226,6 +254,11 @@ files at the DAG level.
 static char *mountfile = NULL;
 static char *mount_cache = NULL;
 static int use_mountfile = 0;
+
+/*
+Options related to TLQ debugging
+*/
+static int tlq_port = 0;
 
 /*
 If enabled, then all environment variables are sent
@@ -281,54 +314,50 @@ struct batch_task *makeflow_node_to_task(struct dag_node *n, struct batch_queue 
 		batch_task_set_command(task, n->command);
 
 	} else if(n->type==DAG_NODE_TYPE_WORKFLOW) {
-
 		/* A sub-workflow must be expanded into a makeflow invocation */
+		buffer_t b;
+		buffer_init(&b);
 
-		char *cmd = string_format("makeflow -T local %s",n->workflow_file);
-		char *oldcmd = 0;
-
-		/* Select the workflow language */
-
-		if(n->workflow_is_jx) {
-			oldcmd = cmd;
-			cmd = string_format("%s --jx",cmd);
-			free(oldcmd);
+		if (batch_queue_supports_feature(remote_queue, "remote_rename")) {
+			const char *basename = path_basename(makeflow_exe);
+			makeflow_hook_add_input_file(n->d,task,makeflow_exe,basename,DAG_FILE_TYPE_TEMP);
+			buffer_printf(&b, "./%s", basename);
+		} else {
+			buffer_printf(&b, "%s", makeflow_exe);
 		}
 
-		/* Generate the workflow arguments file */
+		buffer_printf(&b, " -T local %s", n->workflow_file);
 
+		const char *log = dag_node_nested_workflow_filename(n, "makeflowlog");
+		buffer_printf(&b, " -l %s", log);
+		makeflow_hook_add_output_file(n->d,task,log,log,DAG_FILE_TYPE_TEMP);
+
+		/* Select the workflow language */
+		if(n->workflow_is_jx) {
+			buffer_printf(&b, " --jx");
+		}
+
+		/* Generate the filenames for nested workflows */
 		if(n->workflow_args) {
-			oldcmd = cmd;
-			cmd = string_format("%s --jx-args %s",cmd,n->workflow_args_file);
-			free(oldcmd);
-
-			/* Define this file as a temp so it is removed on completion. */
-			makeflow_hook_add_input_file(n->d,task,n->workflow_args_file,n->workflow_args_file,DAG_FILE_TYPE_TEMP);
+			const char *args_file = dag_node_nested_workflow_filename(n, "args");
+			buffer_printf(&b, " --jx-args %s", args_file);
+			makeflow_hook_add_input_file(n->d,task,args_file,args_file,DAG_FILE_TYPE_TEMP);
 		}
 
 		/* Add resource controls to the sub-workflow, if known. */
-
 		if(n->resources_requested->cores>0) {
-			oldcmd = cmd;
-			cmd = string_format("%s --local-cores %d",cmd,(int)n->resources_requested->cores);
-			free(oldcmd);
+			buffer_printf(&b, " --local-cores %s", rmsummary_resource_to_str("cores", n->resources_requested->cores));
 		}
-
 		if(n->resources_requested->memory>0) {
-			oldcmd = cmd;
-			cmd = string_format("%s --local-memory %d",cmd,(int)n->resources_requested->cores);
-			free(oldcmd);
+			buffer_printf(&b, " --local-memory %s", rmsummary_resource_to_str("memory", n->resources_requested->memory));
 		}
-
 		if(n->resources_requested->disk>0) {
-			oldcmd = cmd;
-			cmd = string_format("%s --local-disk %d",cmd,(int)n->resources_requested->cores);
-			free(oldcmd);
+			buffer_printf(&b, " --local-disk %s", rmsummary_resource_to_str("disk", n->resources_requested->disk));
 		}
 
-		batch_task_set_command(task, cmd);
 		batch_task_add_input_file(task,n->workflow_file,n->workflow_file);
-		free(cmd);
+		batch_task_set_command(task, buffer_tostring(&b));
+		buffer_free(&b);
 	} else {
 		fatal("invalid job type %d in dag node (%s)",n->type,n->command);
 	}
@@ -674,7 +703,7 @@ static int makeflow_node_ready(struct dag *d, struct dag_node *n, const struct r
 		}
 	}
 
-	/* If all makeflow checks pass for this node we will 
+	/* If all makeflow checks pass for this node we will
 	return the result of the hooks, which will be 1 if all pass
 	and 0 if any fail. */
 	int rc = makeflow_hook_node_check(n, makeflow_get_queue(n));
@@ -687,7 +716,6 @@ static int makeflow_node_ready(struct dag *d, struct dag_node *n, const struct r
 int makeflow_nodes_local_waiting_count(const struct dag *d) {
 	int count = 0;
 
-	
 	struct dag_node *n;
 	for(n = d->nodes; n; n = n->next) {
 		if(n->state == DAG_NODE_STATE_WAITING && is_local_job(n))
@@ -1026,12 +1054,16 @@ static void makeflow_run( struct dag *d )
 	timestamp_t start = timestamp_get();
 	// Last Report is created stall for first reporting.
 	timestamp_t last_time = start - (60 * 1000 * 1000);
-
+	
 	//reporting to catalog
 	if(catalog_reporting_on){
 		makeflow_catalog_summary(d, project, batch_queue_type, start);
 	}
-
+	
+	if(file_status_on){
+		makeflow_file_summary(d, project, batch_queue_type, start, file_status_name);
+	}
+	
 	while(!makeflow_abort_flag) {
 		makeflow_dispatch_ready_jobs(d);
 		/*
@@ -1089,8 +1121,16 @@ static void makeflow_run( struct dag *d )
 		timestamp_t now = timestamp_get();
 		/* If in reporting mode and 1 min has transpired */
 		if(catalog_reporting_on && ((now-last_time) > (60 * 1000 * 1000))){ 
-			makeflow_catalog_summary(d, project,batch_queue_type,start);
+			makeflow_catalog_summary(d, project,batch_queue_type,start);	
 			last_time = now;
+		}
+
+		/* Create status file */
+		now = timestamp_get();
+		/* If status file mode is on and a time interval has transpired */
+		if(file_status_on && ((now-last_time) > (file_status_interval * 1000 * 1000))){
+			makeflow_file_summary(d, project, batch_queue_type, start, file_status_name);
+			last_time = now; 
 		}
 
 		/* Rather than try to garbage collect after each time in this
@@ -1105,7 +1145,12 @@ static void makeflow_run( struct dag *d )
 
 	/* Always make final report to catalog when workflow ends. */
 	if(catalog_reporting_on){
-		makeflow_catalog_summary(d, project,batch_queue_type,start);
+		makeflow_catalog_summary(d, project,batch_queue_type,start); 
+	}
+	
+	/* Always make final status file when workflow ends. */
+	if(file_status_on){
+		makeflow_file_summary(d, project, batch_queue_type, start, file_status_name);
 	}
 
 	if(makeflow_abort_flag) {
@@ -1169,6 +1214,8 @@ static void show_help_run(const char *cmd)
 	printf("    --send-environment          Send local environment variables for execution.\n");
 	printf(" -S,--submission-timeout=<#>    Time to retry failed batch job submission.\n");
 	printf(" -f,--summary-log=<file>        Write summary of workflow to this file at end.\n");
+	printf("    --file-status=<file>        Write summary of workflow to file periodically.\n");
+	printf("    --file-status-interval=<file>	Set time interval for periodic workflow summary.\n");
 	        /********************************************************************************/
 	printf("\nData Handling:\n");
 	printf("    --archive                   Archive and retrieve archived jobs from archive.\n");
@@ -1216,6 +1263,7 @@ static void show_help_run(const char *cmd)
 	printf("    --amazon-batch-img=<img>    Specify Amazon ECS Image(Used for amazon-batch)\n");
 	printf(" -B,--batch-options=<options>   Add these options to all batch submit files.\n");
 	printf("    --disable-cache             Disable batch system caching.\n");
+	printf("    --disable-heartbeat         Disable job heartbeat check.\n");
 	printf("    --local-cores=#             Max number of local cores to use.\n");
 	printf("    --local-memory=#            Max amount of local memory (MB) to use.\n");
 	printf("    --local-disk=#              Max amount of local disk (MB) to use.\n");
@@ -1244,7 +1292,7 @@ static void show_help_run(const char *cmd)
 	printf(" --enforcement                  Enforce access to only named inputs/outputs.\n");
 	printf(" --parrot-path=<path>           Path to parrot_run for --enforcement.\n");
 	printf(" --env-replace-path=<path>      Path to env_replace for --enforcement.\n");
-	printf(" --mesos-master=<hostname:port> Mesos master address and port\n");
+	printf(" --mesos-master=<hostname:port> Mesos manager address and port\n");
 	printf(" --mesos-path=<path>            Path to mesos python2 site-packages.\n");
 	printf(" --mesos-preload=<path>         Path to libraries needed by Mesos.\n");
 	printf(" --k8s-image=<path>             Container image used by kubernetes.\n");
@@ -1263,6 +1311,10 @@ static void show_help_run(const char *cmd)
 	printf(" --monitor-with-opened-files    Enable monitoring of opened files.\n");
 	printf(" --monitor-log-fmt=<fmt>        Format for monitor logs.(def: resource-rule-%%)\n");
 	printf(" --allocation=<mode>            Specify allocation mode (see manual).\n");
+	        /********************************************************************************/
+	
+	printf("\nTLQ Options:\n");
+	printf(" --tlq=<port> Set the port for TLQ URL lookup (-d and -o required).\n");
 }
 
 int main(int argc, char *argv[])
@@ -1291,7 +1343,7 @@ int main(int argc, char *argv[])
 	timestamp_t time_completed = 0;
 	const char *work_queue_keepalive_interval = NULL;
 	const char *work_queue_keepalive_timeout = NULL;
-	const char *work_queue_master_mode = "standalone";
+	const char *work_queue_manager_mode = "standalone";
 	const char *work_queue_port_file = NULL;
 	double wq_option_fast_abort_multiplier = -1.0;
 	const char *amazon_config = NULL;
@@ -1312,7 +1364,7 @@ int main(int argc, char *argv[])
 	char *debug_file_name = 0;
 	char *batch_mem_type = NULL;
 	category_mode_t allocation_mode = CATEGORY_ALLOCATION_MODE_FIXED;
-	char *mesos_master = "127.0.0.1:5050/";
+	char *mesos_manager = "127.0.0.1:5050/";
 	char *mesos_path = NULL;
 	char *mesos_preload = NULL;
 
@@ -1321,8 +1373,9 @@ int main(int argc, char *argv[])
 
 	dag_syntax_type dag_syntax = DAG_SYNTAX_MAKE;
 	struct jx *jx_args = jx_object(NULL);
-	
-	struct jx *hook_args = jx_object(NULL);
+	struct jx *base_hook_args = jx_object(NULL);
+	struct jx *hook_args = base_hook_args;
+
 	char *k8s_image = NULL;
 	extern struct makeflow_hook makeflow_hook_basic_wrapper;
 	extern struct makeflow_hook makeflow_hook_docker;
@@ -1338,6 +1391,9 @@ int main(int argc, char *argv[])
 	extern struct makeflow_hook makeflow_hook_storage_allocation;
 	extern struct makeflow_hook makeflow_hook_umbrella;
 	extern struct makeflow_hook makeflow_hook_vc3_builder;
+
+	/* save the name of the makeflow executable */
+	path_absolute(argv[0], makeflow_exe, 0);
 
 #ifdef HAS_CURL
 	extern struct makeflow_hook makeflow_hook_archive;
@@ -1360,9 +1416,9 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	s = getenv("WORK_QUEUE_MASTER_MODE");
+	s = getenv("WORK_QUEUE_MANAGER_MODE") ? getenv("WORK_QUEUE_MANAGER_MODE") : getenv("WORK_QUEUE_MASTER_MODE");
 	if(s) {
-		work_queue_master_mode = s;
+		work_queue_manager_mode = s;
 	}
 
 	s = getenv("WORK_QUEUE_NAME");
@@ -1449,7 +1505,7 @@ int main(int argc, char *argv[])
 		LONG_OPT_ARCHIVE_DIR,
 		LONG_OPT_ARCHIVE_READ,
 		LONG_OPT_ARCHIVE_WRITE,
-		LONG_OPT_MESOS_MASTER,
+		LONG_OPT_MESOS_MANAGER,
 		LONG_OPT_MESOS_PATH,
 		LONG_OPT_MESOS_PRELOAD,
 		LONG_OPT_SEND_ENVIRONMENT,
@@ -1457,6 +1513,10 @@ int main(int argc, char *argv[])
 		LONG_OPT_VERBOSE_JOBNAMES,
 		LONG_OPT_MPI_CORES,
 		LONG_OPT_MPI_MEMORY,
+		LONG_OPT_TLQ,
+		LONG_OPT_FILE_STATUS,
+		LONG_OPT_FILE_STATUS_INTERVAL,
+		LONG_OPT_DISABLE_HEARTBEAT
 	};
 
 	static const struct option long_options_run[] = {
@@ -1475,6 +1535,7 @@ int main(int argc, char *argv[])
 		{"debug-rotate-max", required_argument, 0, LONG_OPT_DEBUG_ROTATE_MAX},
 		{"disable-afs-check", no_argument, 0, 'A'},
 		{"disable-cache", no_argument, 0, LONG_OPT_DISABLE_BATCH_CACHE},
+		{"disable-heartbeat", no_argument, 0, LONG_OPT_DISABLE_HEARTBEAT},
 		{"email", required_argument, 0, 'm'},
 		{"enable_hook_example", no_argument, 0, LONG_OPT_HOOK_EXAMPLE},
 		{"wait-for-files-upto", required_argument, 0, LONG_OPT_FILE_CREATION_PATIENCE_WAIT_TIME},
@@ -1568,13 +1629,17 @@ int main(int argc, char *argv[])
 		{"archive-dir", required_argument, 0, LONG_OPT_ARCHIVE_DIR},
 		{"archive-read", no_argument, 0, LONG_OPT_ARCHIVE_READ},
 		{"archive-write", no_argument, 0, LONG_OPT_ARCHIVE_WRITE},
-		{"mesos-master", required_argument, 0, LONG_OPT_MESOS_MASTER},
+		{"mesos-master", required_argument, 0, LONG_OPT_MESOS_MANAGER},
+		{"mesos-master",  required_argument, 0, LONG_OPT_MESOS_MANAGER}, //same as mesos-master
 		{"mesos-path", required_argument, 0, LONG_OPT_MESOS_PATH},
 		{"mesos-preload", required_argument, 0, LONG_OPT_MESOS_PRELOAD},
 		{"k8s-image", required_argument, 0, LONG_OPT_K8S_IMG},
 		{"verbose-jobnames", no_argument, 0, LONG_OPT_VERBOSE_JOBNAMES},
 		{"mpi-cores", required_argument,0, LONG_OPT_MPI_CORES},
 		{"mpi-memory", required_argument,0, LONG_OPT_MPI_MEMORY},
+		{"tlq", required_argument, 0, LONG_OPT_TLQ},
+		{"file-status", required_argument, 0, LONG_OPT_FILE_STATUS},
+		{"file-status-interval", required_argument, 0, LONG_OPT_FILE_STATUS_INTERVAL},
 		{0, 0, 0, 0}
 	};
 
@@ -1583,7 +1648,7 @@ int main(int argc, char *argv[])
 	while((c = jx_getopt(argc, argv, option_string_run, long_options_run, NULL)) >= 0) {
 		switch (c) {
 			case 'a':
-				work_queue_master_mode = "catalog";
+				work_queue_manager_mode = "catalog";
 				break;
 			case 'A':
 				disable_afs_check = 1;
@@ -1742,7 +1807,7 @@ int main(int argc, char *argv[])
 			case 'N':
 				free(project);
 				project = xxstrdup(optarg);
-				work_queue_master_mode = "catalog";
+				work_queue_manager_mode = "catalog";
 				catalog_reporting_on = 1; //set to true
 				break;
 			case 'o':
@@ -1813,6 +1878,9 @@ int main(int argc, char *argv[])
 				break;
 			case LONG_OPT_DISABLE_BATCH_CACHE:
 				cache_mode = 0;
+				break;
+			case LONG_OPT_DISABLE_HEARTBEAT:
+				batch_job_disable_heartbeat = 1;
 				break;
 			case LONG_OPT_HOOK_EXAMPLE:
 				if (makeflow_hook_register(&makeflow_hook_example, &hook_args) == MAKEFLOW_HOOK_FAILURE)
@@ -1955,8 +2023,8 @@ int main(int argc, char *argv[])
 					goto EXIT_WITH_FAILURE;
 				jx_insert(hook_args, jx_string("umbrella_spec"), jx_string(optarg));
 				break;
-			case LONG_OPT_MESOS_MASTER:
-				mesos_master = xxstrdup(optarg);
+			case LONG_OPT_MESOS_MANAGER:
+				mesos_manager = xxstrdup(optarg);
 				break;
 			case LONG_OPT_MESOS_PATH:
 				mesos_path = xxstrdup(optarg);
@@ -2103,6 +2171,17 @@ int main(int argc, char *argv[])
 			case LONG_OPT_MPI_MEMORY:
 				mpi_memory = atoi(optarg);
 				break;
+			case LONG_OPT_TLQ:
+				tlq_port = atoi(optarg);
+				break;
+			case LONG_OPT_FILE_STATUS:
+				file_status_on = 1;
+				file_status_name = optarg;	
+				break;
+			case LONG_OPT_FILE_STATUS_INTERVAL:
+				file_status_on = 1;
+				file_status_interval = atoi(optarg);
+				break;			
 			default:
 				show_help_run(argv[0]);
 				return 1;
@@ -2110,6 +2189,11 @@ int main(int argc, char *argv[])
 	}
 
 	cctools_version_debug(D_MAKEFLOW_RUN, argv[0]);
+
+	/* If cleaning anything, assume local execution. This only really matters for nested workflows. */
+	if(clean_mode != MAKEFLOW_CLEAN_NONE) {
+		batch_queue_type = batch_queue_type_from_string("local");
+	}
 
 	/* Perform initial MPI setup prior to creating the batch queue object. */
 	if(batch_queue_type==BATCH_QUEUE_TYPE_MPI) {
@@ -2153,7 +2237,7 @@ int main(int argc, char *argv[])
 	}
 
 	if(batch_queue_type == BATCH_QUEUE_TYPE_WORK_QUEUE) {
-		if(strcmp(work_queue_master_mode, "catalog") == 0 && project == NULL) {
+		if(strcmp(work_queue_manager_mode, "catalog") == 0 && project == NULL) {
 			fprintf(stderr, "makeflow: Makeflow running in catalog mode. Please use '-N' option to specify the name of this project.\n");
 			fprintf(stderr, "makeflow: Run \"makeflow -h\" for help with options.\n");
 			return 1;
@@ -2161,7 +2245,7 @@ int main(int argc, char *argv[])
 		// Use Work Queue default port in standalone mode when port is not
 		// specified with -p option. In Work Queue catalog mode, Work Queue
 		// would choose an arbitrary port when port is not explicitly specified.
-		if(!port_set && strcmp(work_queue_master_mode, "standalone") == 0) {
+		if(!port_set && strcmp(work_queue_manager_mode, "standalone") == 0) {
 			port_set = 1;
 			port = WORK_QUEUE_DEFAULT_PORT;
 		}
@@ -2268,7 +2352,7 @@ int main(int argc, char *argv[])
 
 	if(batch_queue_type == BATCH_QUEUE_TYPE_MESOS) {
 		batch_queue_set_option(remote_queue, "mesos-path", mesos_path);
-		batch_queue_set_option(remote_queue, "mesos-master", mesos_master);
+		batch_queue_set_option(remote_queue, "mesos-master", mesos_manager);
 		batch_queue_set_option(remote_queue, "mesos-preload", mesos_preload);
 	}
 
@@ -2296,8 +2380,9 @@ int main(int argc, char *argv[])
 	batch_queue_set_logfile(remote_queue, batchlogfilename);
 	batch_queue_set_option(remote_queue, "batch-options", batch_submit_options);
 	batch_queue_set_option(remote_queue, "password", work_queue_password);
-	batch_queue_set_option(remote_queue, "master-mode", work_queue_master_mode);
+	batch_queue_set_option(remote_queue, "manager-mode", work_queue_manager_mode);
 	batch_queue_set_option(remote_queue, "name", project);
+	batch_queue_set_option(remote_queue, "debug", debug_file_name);
 	batch_queue_set_option(remote_queue, "priority", priority);
 	batch_queue_set_option(remote_queue, "keepalive-interval", work_queue_keepalive_interval);
 	batch_queue_set_option(remote_queue, "keepalive-timeout", work_queue_keepalive_timeout);
@@ -2306,12 +2391,13 @@ int main(int argc, char *argv[])
 	batch_queue_set_option(remote_queue, "amazon-config", amazon_config);
 	batch_queue_set_option(remote_queue, "lambda-config", lambda_config);
 	batch_queue_set_option(remote_queue, "working-dir", working_dir);
-	batch_queue_set_option(remote_queue, "master-preferred-connection", work_queue_preferred_connection);
+	batch_queue_set_option(remote_queue, "manager-preferred-connection", work_queue_preferred_connection);
 	batch_queue_set_option(remote_queue, "amazon-batch-config",amazon_batch_cfg);
 	batch_queue_set_option(remote_queue, "amazon-batch-img", amazon_batch_img);
 	batch_queue_set_option(remote_queue, "safe-submit-mode", safe_submit ? "yes" : "no");
 	batch_queue_set_option(remote_queue, "ignore-mem-spec", ignore_mem_spec ? "yes" : "no");
 	batch_queue_set_option(remote_queue, "mem-type", batch_mem_type);
+	batch_queue_set_int_option(remote_queue, "tlq-port", tlq_port);
 
 	char *fa_multiplier = string_format("%f", wq_option_fast_abort_multiplier);
 	batch_queue_set_option(remote_queue, "fast-abort", fa_multiplier);
@@ -2465,6 +2551,15 @@ int main(int argc, char *argv[])
 
 	runtime = timestamp_get();
 
+	if(tlq_port && debug_file_name) {
+		debug(D_TLQ, "looking up makeflow TLQ URL");
+		time_t config_stoptime = time(0) + 10;
+		char *local_tlq_url = tlq_config_url(tlq_port, debug_file_name, config_stoptime);
+		if(!local_tlq_url) debug(D_TLQ, "error looking up makeflow TLQ URL");
+		else debug(D_TLQ, "set makeflow TLQ URL: %s", local_tlq_url);
+	}
+	else if(tlq_port && !debug_file_name) debug(D_TLQ, "cannot lookup makeflow TLQ URL: debug log not set");
+
 	makeflow_run(d);
 
 	if(makeflow_failed_flag == 0 && makeflow_nodes_local_waiting_count(d) > 0) {
@@ -2520,15 +2615,15 @@ EXIT_WITH_FAILURE:
 		exit_value = EXIT_SUCCESS;
 	}
 
-	/* delete all jx args files. We do this here are some of these files may be created in clean mode. */
+	/* delete all files. We do this here are some of these files may be created in clean mode. */
 	{
 		struct dag_node *n;
 		uint64_t key;
 		itable_firstkey(d->node_table);
 		while(itable_nextkey(d->node_table, &key, (void **) &n)) {
-			if(n->workflow_args_file) {
-				debug(D_MAKEFLOW_RUN, "deleting tmp file: %s\n", n->workflow_args_file);
-				unlink(n->workflow_args_file);
+			if(n->workflow_args) {
+				debug(D_MAKEFLOW_RUN, "deleting tmp file: %s\n", dag_node_nested_workflow_filename(n, "args"));
+				unlink(dag_node_nested_workflow_filename(n, "args"));
 			}
 		}
 	}

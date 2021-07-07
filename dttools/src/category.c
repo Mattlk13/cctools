@@ -8,9 +8,12 @@ See the file COPYING for details.
 #include <math.h>
 #include <errno.h>
 #include <float.h>
+#include <stddef.h>
 
+#include "assert.h"
 #include "buffer.h"
 #include "debug.h"
+#include "itable.h"
 #include "list.h"
 #include "macros.h"
 #include "rmsummary.h"
@@ -25,14 +28,18 @@ struct peak_count_time {
 	double  times;
 };
 
-static int64_t memory_bucket_size    = 50;          /* 50 MB */
-static int64_t disk_bucket_size      = 50;          /* 50 MB */
-static int64_t time_bucket_size      = 300000000;   /* 5 minutes */
-static int64_t bytes_bucket_size     = 5*MEGABYTE;  /* 5 MB */
-static int64_t bandwidth_bucket_size = 1000000;     /* 1 Mbit/s */
-static int64_t cores_avg_bucket_size = 100;         /* 1/10 of a core */
-
 static int64_t first_allocation_every_n_tasks = 25; /* tasks */
+
+static const size_t labeled_resources[] = {
+    offsetof(struct rmsummary, cores),
+    offsetof(struct rmsummary, gpus),
+    offsetof(struct rmsummary, memory),
+    offsetof(struct rmsummary, disk),
+    0
+};
+
+/* map from resoure name to int bucket size. Initialized in category_create first time it is called. */
+static struct rmsummary *bucket_sizes = NULL;
 
 struct category *category_create(const char *name) {
 	if(!name)
@@ -47,28 +54,30 @@ struct category *category_create(const char *name) {
 
 	c->first_allocation    = NULL;
 	c->max_allocation      = rmsummary_create(-1);
+	c->min_allocation      = rmsummary_create(-1);
 	c->autolabel_resource  = rmsummary_create(0);
 
-	c->max_resources_seen      = rmsummary_create(-1);
+	c->max_resources_seen = rmsummary_create(-1);
 
-	c->cores_histogram           = histogram_create(1);
-	c->cores_avg_histogram       = histogram_create(cores_avg_bucket_size);
-	c->wall_time_histogram       = histogram_create(time_bucket_size);
-	c->cpu_time_histogram        = histogram_create(time_bucket_size);
-	c->memory_histogram          = histogram_create(memory_bucket_size);
-	c->swap_memory_histogram     = histogram_create(memory_bucket_size);
-	c->virtual_memory_histogram  = histogram_create(memory_bucket_size);
-	c->bytes_read_histogram      = histogram_create(bytes_bucket_size);
-	c->bytes_written_histogram   = histogram_create(bytes_bucket_size);
-	c->bytes_received_histogram  = histogram_create(bytes_bucket_size);
-	c->bytes_sent_histogram      = histogram_create(bytes_bucket_size);
-	c->bandwidth_histogram       = histogram_create(bandwidth_bucket_size);
-	c->total_files_histogram     = histogram_create(1);
-	c->disk_histogram            = histogram_create(disk_bucket_size);
-	c->total_processes_histogram = histogram_create(1);
-	c->max_concurrent_processes_histogram = histogram_create(1);
+    c->histograms = itable_create(0);
 
-	c->time_peak_independece = 0;
+    if(!bucket_sizes) {
+        bucket_sizes = rmsummary_create(-1);
+        bucket_sizes->cores  = 1;
+        bucket_sizes->gpus   = 1;
+        bucket_sizes->memory = 250; /* 250 MB */
+        bucket_sizes->disk   = 250; /* 250 MB */
+    }
+
+    size_t i;
+    for(i = 0; labeled_resources[i]; i++) {
+        const size_t o = labeled_resources[i];
+
+        int64_t bucket_size = rmsummary_get_by_offset(bucket_sizes, o);
+        assert(bucket_size > 0);
+
+        itable_insert(c->histograms, o, histogram_create(bucket_size));
+    }
 
 	c->steady_state = 0;
 	c->completions_since_last_reset = 0;
@@ -100,6 +109,17 @@ void category_specify_max_allocation(struct category *c, const struct rmsummary 
 	rmsummary_merge_max(c->max_allocation, s);
 }
 
+void category_specify_min_allocation(struct category *c, const struct rmsummary *s) {
+	rmsummary_delete(c->min_allocation);
+	c->min_allocation = rmsummary_create(-1);
+
+	rmsummary_merge_max(c->min_allocation, s);
+
+    /* consider the minimum allocation as a measurement. This ensures that max
+     * dynamic allocation is never below min dynamic allocation */
+	rmsummary_merge_max(c->max_resources_seen, s);
+}
+
 void category_specify_first_allocation_guess(struct category *c, const struct rmsummary *s) {
 
 	/* assume user knows what they are doing. */
@@ -113,10 +133,8 @@ void category_specify_first_allocation_guess(struct category *c, const struct rm
 	rmsummary_merge_max(c->first_allocation, s);
 }
 
-/* set autoallocation mode for cores, memory, and disk.  To add other resources see category_enable_auto_resource. */
+/* set autoallocation mode for cores, memory, and disk.  See category_enable_auto_resource to disable per resource. */
 void category_specify_allocation_mode(struct category *c, int mode) {
-	struct rmsummary *r = c->autolabel_resource;
-
 	c->allocation_mode = mode;
 
 	int autolabel = 1;
@@ -124,28 +142,15 @@ void category_specify_allocation_mode(struct category *c, int mode) {
 		autolabel = 0;
 	}
 
-	r->wall_time      = 0;
-	r->cpu_time       = 0;
-	r->swap_memory     = 0;
-	r->virtual_memory  = 0;
-	r->bytes_read      = 0;
-	r->bytes_written   = 0;
-	r->bytes_received  = 0;
-	r->bytes_sent      = 0;
-	r->bandwidth       = 0;
-	r->total_files     = 0;
-	r->total_processes = 0;
-	r->max_concurrent_processes = 0;
-	r->cores_avg       = 0;
-
-	r->cores           = autolabel;
-	r->memory          = autolabel;
-	r->disk            = autolabel;
+    c->autolabel_resource->cores  = autolabel;
+    c->autolabel_resource->memory = autolabel;
+    c->autolabel_resource->disk   = autolabel;
+    c->autolabel_resource->gpus   = 0;
 }
 
 /* set autolabel per resource. */
 int category_enable_auto_resource(struct category *c, const char *resource_name, int autolabel) {
-	return rmsummary_assign_int_field(c->autolabel_resource, resource_name, autolabel);
+	return rmsummary_set(c->autolabel_resource, resource_name, autolabel);
 }
 
 static void category_clear_histogram(struct histogram *h) {
@@ -168,22 +173,15 @@ static void category_clear_histograms(struct category *c) {
 	if(!c)
 		return;
 
-	category_clear_histogram(c->cores_histogram);
-	category_clear_histogram(c->cores_avg_histogram);
-	category_clear_histogram(c->wall_time_histogram);
-	category_clear_histogram(c->cpu_time_histogram);
-	category_clear_histogram(c->max_concurrent_processes_histogram);
-	category_clear_histogram(c->total_processes_histogram);
-	category_clear_histogram(c->memory_histogram);
-	category_clear_histogram(c->swap_memory_histogram);
-	category_clear_histogram(c->virtual_memory_histogram);
-	category_clear_histogram(c->bytes_read_histogram);
-	category_clear_histogram(c->bytes_written_histogram);
-	category_clear_histogram(c->bytes_received_histogram);
-	category_clear_histogram(c->bytes_sent_histogram);
-	category_clear_histogram(c->bandwidth_histogram);
-	category_clear_histogram(c->total_files_histogram);
-	category_clear_histogram(c->disk_histogram);
+    size_t i;
+    for(i = 0; labeled_resources[i]; i++) {
+        const size_t o = labeled_resources[i];
+
+        struct histogram *h = itable_lookup(c->histograms, o);
+        assert(h);
+
+        category_clear_histogram(h);
+    }
 }
 
 static void category_delete_histograms(struct category *c) {
@@ -192,22 +190,17 @@ static void category_delete_histograms(struct category *c) {
 
 	category_clear_histograms(c);
 
-	histogram_delete(c->cores_histogram);
-	histogram_delete(c->cores_avg_histogram);
-	histogram_delete(c->wall_time_histogram);
-	histogram_delete(c->cpu_time_histogram);
-	histogram_delete(c->max_concurrent_processes_histogram);
-	histogram_delete(c->total_processes_histogram);
-	histogram_delete(c->memory_histogram);
-	histogram_delete(c->swap_memory_histogram);
-	histogram_delete(c->virtual_memory_histogram);
-	histogram_delete(c->bytes_read_histogram);
-	histogram_delete(c->bytes_written_histogram);
-	histogram_delete(c->bytes_received_histogram);
-	histogram_delete(c->bytes_sent_histogram);
-	histogram_delete(c->bandwidth_histogram);
-	histogram_delete(c->total_files_histogram);
-	histogram_delete(c->disk_histogram);
+    size_t i;
+    for(i = 0; labeled_resources[i]; i++) {
+        const size_t o = labeled_resources[i];
+
+        struct histogram *h = itable_lookup(c->histograms, o);
+        assert(h);
+
+        histogram_delete(h);
+    }
+
+    itable_delete(c->histograms);
 }
 
 void category_delete(struct hash_table *categories, const char *name) {
@@ -227,6 +220,7 @@ void category_delete(struct hash_table *categories, const char *name) {
 	category_delete_histograms(c);
 
 	rmsummary_delete(c->max_allocation);
+	rmsummary_delete(c->min_allocation);
 	rmsummary_delete(c->first_allocation);
 	rmsummary_delete(c->autolabel_resource);
 	rmsummary_delete(c->max_resources_seen);
@@ -234,7 +228,7 @@ void category_delete(struct hash_table *categories, const char *name) {
 	free(c);
 }
 
-void category_inc_histogram_count_aux(struct histogram *h, double value, double wall_time) {
+void category_inc_histogram_count(struct histogram *h, double value, double wall_time) {
 	if(value >= 0 && wall_time >= 0) {
 
 		histogram_insert(h, value);
@@ -252,13 +246,6 @@ void category_inc_histogram_count_aux(struct histogram *h, double value, double 
 	}
 }
 
-#define category_inc_histogram_count(c, field, summary)\
-{\
-	double value        = (summary)->field;\
-	double wall_time    = (summary)->wall_time;\
-	struct histogram *h = c->field##_histogram;\
-	category_inc_histogram_count_aux(h, value, wall_time);\
-}
 
 void category_first_allocation_accum_times(struct histogram *h, double *keys, double *tau_mean, double *counts_accum, double *times_accum) {
 
@@ -305,7 +292,7 @@ void category_first_allocation_accum_times(struct histogram *h, double *keys, do
 	free(times_values);
 }
 
-int64_t category_first_allocation_min_waste(struct histogram *h, int assume_independence, int64_t top_resource) {
+int64_t category_first_allocation_min_waste(struct histogram *h, int64_t top_resource) {
 	/* Automatically labeling for resource is not activated. */
 	if(top_resource < 0) {
 		return -1;
@@ -337,14 +324,7 @@ int64_t category_first_allocation_min_waste(struct histogram *h, int assume_inde
 			continue;
 		}
 
-		double Pa = 1 - (counts_accum[i]/counts_accum[n-1]);
-
-		if(assume_independence) {
-			Ea = a + a_m*Pa;
-			Ea *= tau_mean;
-		} else {
-			Ea = a*tau_mean + a_m*times_accum[i];
-		}
+        Ea = a*tau_mean + a_m*times_accum[i];
 
 		if(Ea < Ea_1) {
 			Ea_1 = Ea;
@@ -433,13 +413,13 @@ int64_t category_first_allocation_max_throughput(struct histogram *h, int64_t to
 	return a_1;
 }
 
-int64_t category_first_allocation(struct histogram *h, int assume_independence, category_mode_t mode,  int64_t top_resource) {
+int64_t category_first_allocation(struct histogram *h, category_mode_t mode,  int64_t top_resource) {
 
 	int64_t alloc;
 
 	switch(mode) {
 		case CATEGORY_ALLOCATION_MODE_MIN_WASTE:
-			alloc = category_first_allocation_min_waste(h, assume_independence, top_resource);
+			alloc = category_first_allocation_min_waste(h, top_resource);
 			break;
 		case CATEGORY_ALLOCATION_MODE_MAX_THROUGHPUT:
 			alloc = category_first_allocation_max_throughput(h, top_resource);
@@ -454,10 +434,6 @@ int64_t category_first_allocation(struct histogram *h, int assume_independence, 
 	return alloc;
 }
 
-#define update_first_allocation_field(c, top, independence, field)\
-	if(c->autolabel_resource->field) {\
-		(c)->first_allocation->field = category_first_allocation((c)->field##_histogram, independence, (c)->allocation_mode, top->field);\
-	}
 
 int category_update_first_allocation(struct category *c, const struct rmsummary *max_worker) {
 	/* buffer used only for debug output. */
@@ -482,22 +458,24 @@ int category_update_first_allocation(struct category *c, const struct rmsummary 
 		c->first_allocation = rmsummary_create(-1);
 	}
 
-	update_first_allocation_field(c, top, 1, cpu_time);
-	update_first_allocation_field(c, top, 1, wall_time);
-	update_first_allocation_field(c, top, c->time_peak_independece, cores);
-	update_first_allocation_field(c, top, c->time_peak_independece, cores_avg);
-	update_first_allocation_field(c, top, c->time_peak_independece, virtual_memory);
-	update_first_allocation_field(c, top, c->time_peak_independece, memory);
-	update_first_allocation_field(c, top, c->time_peak_independece, swap_memory);
-	update_first_allocation_field(c, top, c->time_peak_independece, bytes_read);
-	update_first_allocation_field(c, top, c->time_peak_independece, bytes_written);
-	update_first_allocation_field(c, top, c->time_peak_independece, bytes_received);
-	update_first_allocation_field(c, top, c->time_peak_independece, bytes_sent);
-	update_first_allocation_field(c, top, c->time_peak_independece, bandwidth);
-	update_first_allocation_field(c, top, c->time_peak_independece, total_files);
-	update_first_allocation_field(c, top, c->time_peak_independece, disk);
-	update_first_allocation_field(c, top, c->time_peak_independece, max_concurrent_processes);
-	update_first_allocation_field(c, top, c->time_peak_independece, total_processes);
+    size_t i;
+    for(i = 0; labeled_resources[i]; i++) {
+        const size_t o = labeled_resources[i];
+        int64_t should_update = rmsummary_get_by_offset(c->autolabel_resource, o);
+
+        if(should_update) {
+            struct histogram *h = itable_lookup(c->histograms, o);
+            assert(h);
+
+            int64_t top_value = rmsummary_get_by_offset(top, o);
+            int64_t new_value = category_first_allocation(h, c->allocation_mode, top_value);
+
+            rmsummary_set_by_offset(c->first_allocation, o, new_value);
+        }
+    }
+
+    /* don't go below min allocation */
+    rmsummary_merge_max(c->first_allocation, c->min_allocation);
 
 	/* From here on we only print debugging info. */
 	struct jx *jsum = rmsummary_to_json(c->first_allocation, 1);
@@ -527,18 +505,34 @@ int category_update_first_allocation(struct category *c, const struct rmsummary 
 int category_accumulate_summary(struct category *c, const struct rmsummary *rs, const struct rmsummary *max_worker) {
 	int update = 0;
 
+    if(!rs) {
+        return update;
+    }
+
 	const struct rmsummary *max  = c->max_allocation;
 	const struct rmsummary *seen = c->max_resources_seen;
 
-	int new_maximum ;
-	if(rs
-			&& (max->cores  > 0 || rs->cores  <= seen->cores)
-			&& (max->memory > 0 || rs->memory <= seen->memory)
-			&& (max->disk   > 0 || rs->disk   <= seen->disk)) {
-		new_maximum = 0;
-	} else {
-		new_maximum = 1;
-	}
+    int new_maximum = 0;
+    if(!c->steady_state) {
+        /* count new maximums only in steady state. */
+        size_t i;
+        for(i = 0; labeled_resources[i]; i++) {
+            const size_t o = labeled_resources[i];
+
+            if(rmsummary_get_by_offset(max, o) > 0) {
+                // an explicit maximum was given, so this resource r cannot
+                // trigger a new maximum
+                continue;
+            }
+
+            if(rmsummary_get_by_offset(rs, o) > rmsummary_get_by_offset(seen, o)) {
+                // the measured is larger than what we have seen, thus we need
+                // to reset the first allocation.
+                new_maximum = 1;
+                break;
+            }
+        }
+    }
 
 	/* a new maximum has been seen, first-allocation is obsolete. */
 	if(new_maximum) {
@@ -552,35 +546,26 @@ int category_accumulate_summary(struct category *c, const struct rmsummary *rs, 
 
 	rmsummary_merge_max(c->max_resources_seen, rs);
 	if(rs && (!rs->exit_type || !strcmp(rs->exit_type, "normal"))) {
-		category_inc_histogram_count(c, cores,          rs);
-		category_inc_histogram_count(c, cores_avg,      rs);
-		category_inc_histogram_count(c, cpu_time,       rs);
-		category_inc_histogram_count(c, wall_time,      rs);
-		category_inc_histogram_count(c, virtual_memory, rs);
-		category_inc_histogram_count(c, memory,         rs);
-		category_inc_histogram_count(c, swap_memory,    rs);
-		category_inc_histogram_count(c, bytes_read,     rs);
-		category_inc_histogram_count(c, bytes_written,  rs);
-		category_inc_histogram_count(c, bytes_sent,     rs);
-		category_inc_histogram_count(c, bytes_received, rs);
-		category_inc_histogram_count(c, bandwidth,      rs);
-		category_inc_histogram_count(c, total_files,    rs);
-		category_inc_histogram_count(c, disk,           rs);
-		category_inc_histogram_count(c, max_concurrent_processes, rs);
-		category_inc_histogram_count(c, total_processes,rs);
+        size_t i;
+        for(i = 0; labeled_resources[i]; i++) {
+            const size_t o = labeled_resources[i];
+
+            struct histogram *h = itable_lookup(c->histograms, o);
+            assert(h);
+
+            double value = rmsummary_get_by_offset(rs, o);
+            double wall_time = rs->wall_time;
+
+            category_inc_histogram_count(h, value, wall_time);
+        }
 
 		c->completions_since_last_reset++;
 
         if(first_allocation_every_n_tasks > 0) {
-            if(new_maximum || c->completions_since_last_reset % first_allocation_every_n_tasks == 0) {
+            if(c->completions_since_last_reset % first_allocation_every_n_tasks == 0) {
                 update |= category_update_first_allocation(c, max_worker);
             }
         }
-
-		/* a task completed using a new maximum, so we consider that the new steady_state. */
-		if(new_maximum) {
-			c->steady_state = 1;
-		}
 
         c->total_tasks++;
 	}
@@ -623,19 +608,6 @@ void categories_initialize(struct hash_table *categories, struct rmsummary *top,
 	}
 }
 
-#define check_hard_limits(max, user, measured, field, flag)\
-	if(!flag) {\
-		if(user && user->field > -1) {\
-			if(measured->field > user->field) {\
-				flag = 1;\
-			}\
-		}\
-		else if(max && max->field > -1) {\
-			if(measured->field > max->field) {\
-				flag = 1;\
-			}\
-		}\
-	}
 
 /* returns the next allocation state. */
 category_allocation_t category_next_label(struct category *c, category_allocation_t current_label, int resource_overflow, struct rmsummary *user, struct rmsummary *measured) {
@@ -645,25 +617,31 @@ category_allocation_t category_next_label(struct category *c, category_allocatio
 			return CATEGORY_ALLOCATION_ERROR;
 		}
 
+        /* We check per resource if the measured allocation went over the
+         * maximum user specified per task or per category.
+         * If so, we return error, as there is nothing else we can do.
+         * Otherwise, we go to the maximum allocation. */
 		int over = 0;
-		if(measured) {
-			check_hard_limits(c->max_allocation, user, measured, cores,                    over);
-			check_hard_limits(c->max_allocation, user, measured, cores_avg,                over);
-			check_hard_limits(c->max_allocation, user, measured, cpu_time,                 over);
-			check_hard_limits(c->max_allocation, user, measured, wall_time,                over);
-			check_hard_limits(c->max_allocation, user, measured, virtual_memory,           over);
-			check_hard_limits(c->max_allocation, user, measured, memory,                   over);
-			check_hard_limits(c->max_allocation, user, measured, swap_memory,              over);
-			check_hard_limits(c->max_allocation, user, measured, bytes_read,               over);
-			check_hard_limits(c->max_allocation, user, measured, bytes_written,            over);
-			check_hard_limits(c->max_allocation, user, measured, bytes_sent,               over);
-			check_hard_limits(c->max_allocation, user, measured, bytes_received,           over);
-			check_hard_limits(c->max_allocation, user, measured, bandwidth,                over);
-			check_hard_limits(c->max_allocation, user, measured, total_files,              over);
-			check_hard_limits(c->max_allocation, user, measured, disk,                     over);
-			check_hard_limits(c->max_allocation, user, measured, max_concurrent_processes, over);
-			check_hard_limits(c->max_allocation, user, measured, total_processes,          over);
-		}
+        if(measured) {
+            size_t i;
+            for(i = 0; labeled_resources[i]; i++) {
+                const size_t o = labeled_resources[i];
+                if(!over) {
+                    int64_t meas_value = rmsummary_get_by_offset(measured, o);
+                    if(user) {
+                        int64_t user_value = rmsummary_get_by_offset(user, o);
+                        if(user_value > -1 && meas_value > user_value) {
+                            over = 1;
+                        }
+                    } else if(c->max_allocation) {
+                        int64_t max_value = rmsummary_get_by_offset(c->max_allocation, o);
+                        if(max_value > -1 && meas_value > max_value) {
+                            over = 1;
+                        }
+                    }
+                }
+            }
+        }
 
 		return over ? CATEGORY_ALLOCATION_ERROR : CATEGORY_ALLOCATION_MAX;
 	}
@@ -689,30 +667,31 @@ const struct rmsummary *category_dynamic_task_max_resources(struct category *c, 
 	struct rmsummary *seen  = c->max_resources_seen;
 
 	if(c->steady_state && c->allocation_mode != CATEGORY_ALLOCATION_MODE_FIXED) {
-		internal->cores  = seen->cores;
-		internal->memory = seen->memory;
-		internal->disk   = seen->disk;
+        size_t i;
+        for(i = 0; labeled_resources[i]; i++) {
+            const size_t o = labeled_resources[i];
+            /* set internal to seen value */
+            rmsummary_set_by_offset(internal, o, rmsummary_get_by_offset(seen, o));
+        }
 	}
 
 	/* load max values */
 	rmsummary_merge_override(internal, max);
 
-	if(c->allocation_mode != CATEGORY_ALLOCATION_MODE_FIXED
-			&& request == CATEGORY_ALLOCATION_FIRST) {
+    if(category_in_steady_state(c) && c->allocation_mode != CATEGORY_ALLOCATION_MODE_FIXED
+            && request == CATEGORY_ALLOCATION_FIRST) {
 		rmsummary_merge_override(internal, first);
 	}
 
-	/* chip in user values */
+	/* chip in user values if explicitely given */
 	rmsummary_merge_override(internal, user);
 
 	return internal;
 }
 
 const struct rmsummary *category_dynamic_task_min_resources(struct category *c, struct rmsummary *user, category_allocation_t request) {
-
 	static struct rmsummary *internal = NULL;
-
-	const struct rmsummary *max = category_dynamic_task_max_resources(c, user, request);
+	const struct rmsummary *allocation = category_dynamic_task_max_resources(c, user, request);
 
 	if(internal) {
 		rmsummary_delete(internal);
@@ -724,56 +703,39 @@ const struct rmsummary *category_dynamic_task_min_resources(struct category *c, 
 	struct rmsummary *seen = c->max_resources_seen;
 
 	if(c->allocation_mode != CATEGORY_ALLOCATION_MODE_FIXED) {
-			internal->cores  = seen->cores;
-			internal->memory = seen->memory;
-			internal->disk   = seen->disk;
+        size_t i;
+        for(i = 0; labeled_resources[i]; i++) {
+            const size_t o = labeled_resources[i];
+            /* set internal to seen value */
+            rmsummary_set_by_offset(internal, o, rmsummary_get_by_offset(seen, o));
+        }
 	}
 
-	rmsummary_merge_override(internal, max);
+    /* prefer first allocation (if available) to maximum seen. */
+	rmsummary_merge_override(internal, allocation);
+
+    /* but don't go below the minimum defined for the category. */
+	rmsummary_merge_max(internal, c->min_allocation);
 
 	return internal;
 }
 
 int category_in_steady_state(struct category *c) {
-	return c->first_allocation != NULL;
+	return c->steady_state;
 }
 
 void category_tune_bucket_size(const char *resource, int64_t size) {
-
-	if(strcmp(resource, "memory") == 0) {
-		memory_bucket_size = size;
-	} else if(strcmp(resource, "disk") == 0) {
-		disk_bucket_size = size;
-	} else if(strcmp(resource, "time") == 0) {
-		time_bucket_size = size;
-	} else if(strcmp(resource, "io") == 0) {
-		bytes_bucket_size = size;
-	} else if(strcmp(resource, "bandwidth") == 0) {
-		bandwidth_bucket_size = size;
-	} else if(strcmp(resource, "category-steady-n-tasks") == 0) {
-		first_allocation_every_n_tasks = size;
-	}
+    if(strcmp(resource, "category-steady-n-tasks") == 0) {
+        first_allocation_every_n_tasks = size;
+    } else {
+        rmsummary_set(bucket_sizes, resource, size);
+    }
 }
 
 int64_t category_get_bucket_size(const char *resource) {
-	if(string_suffix_is(resource, "memory")) {
-		return memory_bucket_size;
-	} else if(strcmp(resource, "cores") == 0) {
-		return 1;
-	} else if(strcmp(resource, "cores_avg") == 0) {
-		return cores_avg_bucket_size;
-	} else if(string_prefix_is(resource, "bytes")) {
-		return bytes_bucket_size;
-	} else if(string_suffix_is(resource, "time")) {
-		return time_bucket_size;
-	} else if(strcmp(resource, "disk") == 0) {
-		return disk_bucket_size;
-	} else if(strcmp(resource, "bandwidth") == 0) {
-		return bandwidth_bucket_size;
-	} else if(strcmp(resource, "category-steady-n-tasks") == 0) {
-		return first_allocation_every_n_tasks;
-	}
-
-	fatal("No such bucket: '%s'", resource);
-	return 0;
+    if(strcmp(resource, "category-steady-n-tasks") == 0) {
+        return first_allocation_every_n_tasks;
+    } else {
+        return rmsummary_get(bucket_sizes, resource);
+    }
 }

@@ -35,17 +35,20 @@ sub DESTROY {
 }
 
 sub _determine_file_flags {
-	my ($flags, $cache) = @_;
+	my ($flags, $cache, $failure_only) = @_;
 
-	# flags overrides cache, always.
-	# cache by default if both undefined.
+	# flags overrides cache, and failure_only always.
 	return $flags if defined $flags;
 
-	return $WORK_QUEUE_CACHE unless defined $cache;
+    if($cache) {
+        $flags |= $WORK_QUEUE_CACHE;
+    }
 
-	return $WORK_QUEUE_CACHE if $cache;
+    if($failure_only) {
+        $flags |= $WORK_QUEUE_FAILURE_ONLY;
+    }
 
-	return $WORK_QUEUE_NOCACHE if $cache;
+	return $flags;
 }
 
 sub specify_tag {
@@ -96,11 +99,30 @@ sub specify_file {
 	$args{remote_name} //= $args{local_name};
 	$args{type}        //= $WORK_QUEUE_INPUT;
 	$args{cache}       //= 1;
-	$args{flags}         = _determine_file_flags($args{flags}, $args{cache});
+	$args{failure_only} //= 0;
+	$args{flags}         = _determine_file_flags($args{flags}, $args{cache}, $args{failure_only});
 
 	return work_queue_task_specify_file($self->{_task},
 					$args{local_name},
 					$args{remote_name},
+					$args{type},
+					$args{flags});
+}
+
+sub specify_file_command {
+	my $self = shift;
+	my %args = @_;
+
+	croak "At least remote_name and cmd should be specified." unless $args{remote_name} and $args{cmd};
+
+	$args{type}        //= $WORK_QUEUE_INPUT;
+	$args{cache}       //= 1;
+	$args{failure_only} //= 0;
+	$args{flags}         = _determine_file_flags($args{flags}, $args{cache});
+
+	return work_queue_task_specify_file_command($self->{_task},
+					$args{remote_name},
+					$args{cmd},
 					$args{type},
 					$args{flags});
 }
@@ -116,6 +138,7 @@ sub specify_file_piece {
 	$args{end_byte}    //= 0;
 	$args{type}        //= $WORK_QUEUE_INPUT;
 	$args{cache}       //= 1;
+	$args{failure_only} //= 0;
 	$args{flags}         = _determine_file_flags($args{flags}, $args{cache});
 
 	return work_queue_task_specify_file_piece($self->{_task},
@@ -136,7 +159,8 @@ sub specify_input_file {
 				   remote_name => $args{remote_name},
 				   type        => $WORK_QUEUE_INPUT,
 				   flags       => $args{flags},
-				   cache       => $args{cache});
+				   cache       => $args{cache},
+				   failure_only => 0);
 }
 
 sub specify_output_file {
@@ -149,7 +173,8 @@ sub specify_output_file {
 				   remote_name => $args{remote_name},
 				   type        => $WORK_QUEUE_OUTPUT,
 				   flags       => $args{flags},
-				   cache       => $args{cache});
+				   cache       => $args{cache},
+				   failure_only => $args{failure_only});
 }
 
 sub specify_directory {
@@ -162,7 +187,8 @@ sub specify_directory {
 	$args{recursive}   //= 0;
 
 	$args{cache}       //= 1;
-	$args{flags}         = _determine_file_flags($args{flags}, $args{cache});
+	$args{failure_only} //= 0;
+	$args{flags}         = _determine_file_flags($args{flags}, $args{cache}, $args{failure_only});
 
 	return work_queue_task_specify_directory($self->{_task},
 						 $args{local_name},
@@ -179,7 +205,8 @@ sub specify_buffer {
 	unless ($args{remote_name} and $args{buffer});
 
 	$args{cache}       //= 1;
-	$args{flags}         = _determine_file_flags($args{flags}, $args{cache});
+	$args{failure_only} //= 0;
+	$args{flags}         = _determine_file_flags($args{flags}, $args{cache}, $args{failure_only});
 
 	return work_queue_task_specify_buffer($self->{_task},
 					  $args{buffer},
@@ -232,6 +259,15 @@ sub specify_running_time {
 	return work_queue_task_specify_running_time($self->{_task}, $useconds);
 }
 
+sub specify_running_time_max {
+	my ($self, $seconds) = @_;
+	return work_queue_task_specify_running_time_max($self->{_task}, $seconds);
+}
+
+sub specify_running_time_min {
+	my ($self, $seconds) = @_;
+	return work_queue_task_specify_running_time_min($self->{_task}, $seconds);
+}
 sub specify_priority {
 	my ($self, $priority) = @_;
 	return work_queue_task_specify_priority($self->{_task}, $priority);
@@ -240,7 +276,7 @@ sub specify_priority {
 
 sub specify_environment_variable {
 	my ($self, $name, $value) = @_;
-	return work_queue_task_specify_enviroment_variable($self->{_task}, $name, $value);
+	return work_queue_task_specify_environment_variable($self->{_task}, $name, $value);
 }
 
 sub specify_monitor_output {
@@ -286,6 +322,11 @@ sub return_status {
 sub result {
 	my ($self) = @_;
 	return $self->{_task}->{result};
+}
+
+sub result_str {
+	my ($self) = @_;
+	return work_queuec::work_queue_result_str($self->{_task}->{result});
 }
 
 sub total_submissions {
@@ -580,17 +621,66 @@ May be zero to indicate no special handling, or any of the following or'd togeth
 
 =item $Work_Queue::WORK_QUEUE_WATCH
 
+=item $Work_Queue::WORK_QUEUE_FAILURE_ONLY
+
 =back
 
 =item cache
 
-Legacy parameter for setting file caching attribute.  By default this is enabled.
+Whether the file should be cached at workers. By default this is enabled.
+
+=item failure_only
+
+For output files only, whether the file should be retrieved only when the task fails. On successful executions the file will not be retrieved.
 
 =back
 
 		$t->specify_file(local_name => ...);
 
 		$t->specify_file(local_name => ..., remote_name => ..., );
+
+=head3 C<specify_file_command>
+
+Add a file to the task which will be transfered with a command at the worker.
+
+=item remote_name
+
+The name of the file at the execution site.
+
+=item cmd
+
+The shell command to transfer the file. Any occurance of the string %% will be
+replaced with the internal name that work queue uses for the file.
+
+=item type
+
+Must be one of the following values: $Work_Queue::WORK_QUEUE_INPUT or $Work_Queue::WORK_QUEUE_OUTPUT
+
+=item flags
+
+May be zero to indicate no special handling, or any of the following or'd together:
+
+=over 24
+
+=item $Work_Queue::WORK_QUEUE_NOCACHE
+
+=item $Work_Queue::WORK_QUEUE_CACHE
+
+=item $Work_Queue::WORK_QUEUE_FAILURE_ONLY
+
+=back
+
+=item cache
+
+Whether the file should be cached at workers. By default this is enabled.
+
+=item failure_only
+
+For output files only, whether the file should be retrieved only when the task fails. On successful executions the file will not be retrieved.
+
+=back
+
+        $t->specify_file_command("my.result", "chirp_put %% chirp://somewhere/result.file", type=$Work_Queue::WORK_QUEUE_OUTPUT)
 
 =head3 C<specify_file_piece>
 
@@ -626,7 +716,11 @@ or'd together. See Work_Queue::Task->specify_file
 
 =item cache
 
-Legacy parameter for setting file caching attribute.  By default this is enabled.
+Whether the file should be cached at workers. By default this is enabled.
+
+=item failure_only
+
+For output files only, whether the file should be retrieved only when the task fails. On successful executions the file will not be retrieved.
 
 =back
 
@@ -679,7 +773,11 @@ its contents (1) should be included.
 
 =item cache
 
-Legacy parameter for setting file caching attribute.  By default this is enabled.
+Whether the file should be cached at workers. By default this is enabled.
+
+=item failure_only
+
+For output files only, whether the file should be retrieved only when the task fails. On successful executions the file will not be retrieved.
 
 =back
 
@@ -707,7 +805,11 @@ May take the same values as Work_Queue::Task->specify_file.
 
 =item cache
 
-Legacy parameter for setting file caching attribute.  By default this is enabled.
+Whether the file should be cached at workers. By default this is enabled.
+
+=item failure_only
+
+For output files only, whether the file should be retrieved only when the task fails. On successful executions the file will not be retrieved.
 
 =back
 
@@ -844,14 +946,44 @@ Number of microseconds.
 
 =head3 C<specify_running_time>
 
-Indicate the maximum running time for a task in a worker (relative to when the
-task starts to run).  If less than 1, or not specified, no limit is imposed.
+Indicate the maximum running time (in microseconds) for a task in a worker
+(relative to when the task starts to run).  If less than 1, or not specified,
+no limit is imposed.
+Note: Same as specify_running_time_max, but specified in microseconds. Kept for
+backwards compatibility.
 
 =over 12
 
 =item useconds
 
 Number of microseconds.
+
+=back
+
+=head3 C<specify_running_time_max>
+
+Indicate the maximum running time (in seconds) for a task in a worker (relative to when the
+task starts to run).  If less than 1, or not specified, no limit is imposed.
+
+=over 12
+
+=item seconds
+
+Number of seconds.
+
+=back
+
+
+=head3 C<specify_running_time_min>
+
+Indicate the minimum running time (in seconds) the task needs (relative to when the
+task starts to run).  If less than 1, or not specified, no minimum time is defined.
+
+=over 12
+
+=item seconds
+
+Number of seconds.
 
 =back
 
@@ -929,9 +1061,13 @@ after the task completes execution.
 
 =head3 C<result>
 
-Get the result of the task (successful, failed return_status, missing input file, missing output file).
+Get the result of the task as in integer (successful, failed return_status, missing input file, missing output file).
 
 Must be called only after the task completes execution.
+
+=head3 C<result_str>
+
+Returns a string that explains the result of a task. (SUCCESS, INPUT_MISS, OUTPUT_MISS, etc.)
 
 =head3 C<total_submissions>
 
@@ -993,7 +1129,7 @@ Must be called only after the task completes execution.
 
 =head3 C<execute_cmd_finish>
 
-Get the time at which the task finished (discovered by the master).
+Get the time at which the task finished (discovered by the manager).
 
 Must be called only after the task completes execution.
 

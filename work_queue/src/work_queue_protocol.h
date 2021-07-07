@@ -6,7 +6,7 @@ See the file COPYING for details.
 
 /** @file work_queue_protocol.h
 This file describes a handful of constants that are necessary for
-a common implementation of the work queue protocol between the master,
+a common implementation of the work queue protocol between the manager,
 worker, and catalog, but should not be visible to the WQ user API.
 This file should not be installed and should only be included by .c files.
 */
@@ -19,7 +19,8 @@ This file should not be installed and should only be included by .c files.
 /* 6: worker only report total, max, and min resources. */
 /* 7: added category message */
 /* 8: worker send feature message. */
-#define WORK_QUEUE_PROTOCOL_VERSION 8
+/* 9: recursive send/recv and filename encoding. */
+#define WORK_QUEUE_PROTOCOL_VERSION 9
 
 #define WORK_QUEUE_LINE_MAX 4096       /**< Maximum length of a work queue message line. */
 #define WORK_QUEUE_POOL_NAME_MAX 128   /**< Maximum length of a work queue pool name. */

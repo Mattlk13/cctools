@@ -47,7 +47,7 @@ OPTIONS_END
 
 SUBSECTION(Workflow Handling)
 OPTIONS_BEGIN
-OPTION_ITEM(`-a, --advertise')Advertise the master information to a catalog server.
+OPTION_ITEM(`-a, --advertise')Advertise the manager information to a catalog server.
 OPTION_TRIPLET(-l, makeflow-log, logfile)Use this file for the makeflow log. (default is X.makeflowlog)
 OPTION_TRIPLET(-L, batch-log, logfile)Use this file for the batch system log. (default is X.PARAM(type)log)
 OPTION_TRIPLET(-m, email, email)Email summary of workflow to address.
@@ -88,7 +88,7 @@ OPTIONS_END
 SUBSECTION(Debugging Options)
 OPTIONS_BEGIN
 OPTION_TRIPLET(-d, debug, subsystem)Enable debugging for this subsystem.
-OPTION_TRIPLET(-o,debug-file,file)Write debugging output to this file. By default, debugging is sent to stderr (":stderr"). You may specify logs be sent to stdout (":stdout"), to the system syslog (":syslog"), or to the systemd journal (":journal").
+OPTION_TRIPLET(-o,debug-file,file)Write debugging output to this file. By default, debugging is sent to stderr (":stderr"). You may specify logs to be sent to stdout (":stdout") instead.
 OPTION_PAIR(--debug-rotate-max, byte)Rotate debug file once it reaches this size.
 OPTION_ITEM(`--verbose')Display runtime progress on stdout.
 OPTIONS_END
@@ -160,7 +160,7 @@ OPTIONS_END
 
 SUBSECTION(Mesos Options)
 OPTIONS_BEGIN
-OPTION_PAIR(--mesos-master, hostname) Indicate the host name of preferred mesos master.
+OPTION_PAIR(--mesos-master, hostname) Indicate the host name of preferred mesos manager.
 OPTION_PAIR(--mesos-path, filepath) Indicate the path to mesos python2 site-packages.
 OPTION_PAIR(--mesos-preload, library) Indicate the linking libraries for running mesos..
 
@@ -232,7 +232,7 @@ serial that Makeflow would have run. This shell script format may be useful
 for archival purposes, since it does not depend on Makeflow.
 
 SECTION(MPI)
-When cctools is built with --with-mpicc-path=`which mpicc` configuration, Makeflow can be ran as an MPI program.
+When cctools is built with --with-mpi-path=`which mpicc` configuration, Makeflow can be ran as an MPI program.
 To do so, run Makeflow as an argument to BOLD(mpirun)/BOLD(mpiexec) and set BOLD(-T) PARAM(mpi) as a Makeflow option.
 When submitting mpi, request one process per core. Makeflow will count up how many processes each node given to MPI
 has, and use that as the core count for the worker on that node. Makeflow will then share memory evenly amongst the cores

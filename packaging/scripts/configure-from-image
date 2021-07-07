@@ -27,7 +27,7 @@ done
 
 cd ${CCTOOLS_SRC}
 
-if [[ -d /opt/vc3/cctools-deps ]]
+if [[ -d /opt/vc3/cctools-deps/musl ]]
 then
     # compile work_queue binaries statically
     [[ -f config.mk ]] && make clean
@@ -38,16 +38,30 @@ then
     STATIC_WORKER=1
 fi
 
-# disable perl bindings in osx (to compile as we do in conda)
-perl_option=''
-if [[ "${TRAVIS_OS_NAME}" = osx ]]
+# disable perl bindings (to compile as we do in conda)
+perl_option='--with-perl-path no'
+
+
+# using rpm/deb for cvmfs from cclnd docker containers
+if [[ -n "${CCTOOLS_DOCKER_GITHUB}" ]]
 then
-    perl_option='--with-perl-path no'
+    cvmfs_option='--with-cvmfs-path /usr'
+
+    # ensure both python2 and python3 are built for centos7
+    python_option='--with-python3-path /usr'
+    if [[ "${CCTOOLS_DOCKER_GITHUB}" = centos7 ]]
+    then
+        python_option='--with-python2-path /usr --with-python3-path /usr'
+    fi
 fi
 
+
 # compile everything
-./configure --strict $DEP_ARGS ${perl_option} "$@"
+./configure --debug --strict $DEP_ARGS ${perl_option} ${python_option} ${cvmfs_option} "$@"
 [[ -f config.mk ]] && make clean
+echo === Contents of config.mk ===
+cat config.mk
+
 make
 
 if [[ "${STATIC_WORKER}" = 1 ]]
@@ -61,6 +75,7 @@ make install
 
 if ! make test
 then
+    echo === Contents of cctools.test.fail ===
     cat cctools.test.fail
     exit 1
 else

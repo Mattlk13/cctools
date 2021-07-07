@@ -7,14 +7,14 @@ See the file COPYING for details.
 #ifndef WORK_QUEUE_H
 #define WORK_QUEUE_H
 
-/** @file work_queue.h A master-worker library.
- The work queue provides an implementation of the master-worker computing model
+/** @file work_queue.h A manager-worker library.
+ The work queue provides an implementation of the manager-worker computing model
  using TCP sockets, Unix applications, and files as intermediate buffers.  A
- master process uses @ref work_queue_create to create a queue, then @ref
+ manager process uses @ref work_queue_create to create a queue, then @ref
  work_queue_submit to submit tasks.  Once tasks are running, call @ref
  work_queue_wait to wait for completion. A generic worker program, named
  <tt>work_queue_worker</tt>, can be run on any machine, and simply needs to be
- told the host and port of the master.
+ told the host and port of the manager.
 */
 
 #include <sys/types.h>
@@ -39,10 +39,13 @@ typedef enum {
 	WORK_QUEUE_NOCACHE  = 0, /**< Do not cache file at execution site. */
 	WORK_QUEUE_CACHE    = 1, /**< Cache file at execution site for later use. */
 	WORK_QUEUE_SYMLINK  = 2, /**< Create a symlink to the file rather than copying it, if possible. */
-	WORK_QUEUE_PREEXIST = 4, /**< If the filename already exists on the host, use it in place. */
 	WORK_QUEUE_THIRDGET = 8, /**< Access the file on the client from a shared filesystem */
 	WORK_QUEUE_THIRDPUT = 8, /**< Access the file on the client from a shared filesystem (same as WORK_QUEUE_THIRDGET, included for readability) */
-	WORK_QUEUE_WATCH    = 16 /**< Watch the output file and send back changes as the task runs. */
+	WORK_QUEUE_WATCH    = 16, /**< Watch the output file and send back changes as the task runs. */
+	WORK_QUEUE_FAILURE_ONLY = 32,/**< Only return this output file if the task failed.  (Useful for returning large log files.) */
+	WORK_QUEUE_SUCCESS_ONLY = 64, /**< Only return this output file if the task succeeded. */
+
+	WORK_QUEUE_PREEXIST = 4 /**< If the filename already exists on the host, use it in place. (Warning: Internal work queue use only.) */
 } work_queue_file_flags_t;
 
 typedef enum {
@@ -76,7 +79,7 @@ typedef enum {
 	WORK_QUEUE_TASK_READY,             /**< Task is ready to be run, waiting in queue **/
 	WORK_QUEUE_TASK_RUNNING,           /**< Task has been dispatched to some worker **/
 	WORK_QUEUE_TASK_WAITING_RETRIEVAL, /**< Task results are available at the worker **/
-	WORK_QUEUE_TASK_RETRIEVED,         /**< Task results are available at the master **/
+	WORK_QUEUE_TASK_RETRIEVED,         /**< Task results are available at the manager **/
 	WORK_QUEUE_TASK_DONE,              /**< Task is done, and returned through work_queue_wait >**/
 	WORK_QUEUE_TASK_CANCELED,           /**< Task was canceled before completion **/
 } work_queue_task_state_t;
@@ -89,6 +92,26 @@ typedef enum {
 	WORK_QUEUE_DIRECTORY,             /**< File-spec is a directory **/
 	WORK_QUEUE_URL                    /**< File-spec refers to an URL **/
 } work_queue_file_t;
+
+
+/** Here we repeat the category_mode_t declaration but with work_queue names.
+ * This is needed to generate uniform names in the API and bindings. */
+typedef enum {
+/**< When monitoring is disabled, all tasks run as
+  WORK_QUEUE_ALLOCATION_MODE_FIXED. If monitoring is enabled and resource
+  exhaustion occurs: */
+    WORK_QUEUE_ALLOCATION_MODE_FIXED          = CATEGORY_ALLOCATION_MODE_FIXED,
+/**< If maximum values are specified for cores, memory,
+disk or gpus (either a user-label or category-label) and one of those resources
+is exceeded, the task fails.  Otherwise it is retried until a large enough
+worker connects to the manager, using the maximum values specified, and the
+maximum values so far seen for resources not specified. */
+    WORK_QUEUE_ALLOCATION_MODE_MAX            = CATEGORY_ALLOCATION_MODE_MAX,
+/**< As above, but tasks are tried with an automatically computed first-allocation to minimize resource waste. */
+    WORK_QUEUE_ALLOCATION_MODE_MIN_WASTE      = CATEGORY_ALLOCATION_MODE_MIN_WASTE,
+/**< As above, but maximizing throughput. */
+    WORK_QUEUE_ALLOCATION_MODE_MAX_THROUGHPUT = CATEGORY_ALLOCATION_MODE_MAX_THROUGHPUT
+} work_queue_category_mode_t;
 
 
 extern int wq_option_scheduler;	               /**< Initial setting for algorithm to assign tasks to
@@ -123,6 +146,7 @@ struct work_queue_task {
 
 	int try_count;          /**< The number of times the task has been dispatched to a worker. If larger than max_retries, the task failes with @ref WORK_QUEUE_RESULT_MAX_RETRIES. */
 	int exhausted_attempts; /**< Number of times the task failed given exhausted resources. */
+	int fast_abort_count; /**< Number of times this task has been terminated for running too long. */
 
 	/* All times in microseconds */
 	/* A time_when_* refers to an instant in time, otherwise it refers to a length of time. */
@@ -131,10 +155,13 @@ struct work_queue_task {
 
 	int disk_allocation_exhausted;                        /**< Non-zero if a task filled its loop device allocation, zero otherwise. */
 
+	int64_t min_running_time;           /**< Minimum time (in seconds) the task needs to run. (see work_queue_worker --wall-time)*/
+
+    /**< All fields of the form time_* in microseconds. */
 	timestamp_t time_when_commit_start; /**< The time when the task starts to be transfered to a worker. */
 	timestamp_t time_when_commit_end;   /**< The time when the task is completely transfered to a worker. */
 
-	timestamp_t time_when_retrieval;    /**< The time when output files start to be transfered back to the master. time_done - time_when_retrieval is the time taken to transfer output files. */
+	timestamp_t time_when_retrieval;    /**< The time when output files start to be transfered back to the manager. time_done - time_when_retrieval is the time taken to transfer output files. */
 
 	timestamp_t time_workers_execute_last;                 /**< Duration of the last complete execution for this task. */
 	timestamp_t time_workers_execute_all;                  /**< Accumulated time for executing the command on any worker, regardless of whether the task completed (i.e., this includes time running on workers that disconnected). */
@@ -188,19 +215,19 @@ struct work_queue_task {
 
 struct work_queue_stats {
 	/* Stats for the current state of workers: */
-	int workers_connected;	  /**< Number of workers currently connected to the master. */
+	int workers_connected;	  /**< Number of workers currently connected to the manager. */
 	int workers_init;         /**< Number of workers connected, but that have not send their available resources report yet.*/
 	int workers_idle;         /**< Number of workers that are not running a task. */
 	int workers_busy;         /**< Number of workers that are running at least one task. */
 	int workers_able;         /**< Number of workers on which the largest task can run. */
 
 	/* Cumulative stats for workers: */
-	int workers_joined;       /**< Total number of worker connections that were established to the master. */
-	int workers_removed;      /**< Total number of worker connections that were released by the master, idled-out, fast-aborted, or lost. */
-	int workers_released;     /**< Total number of worker connections that were asked by the master to disconnect. */
+	int workers_joined;       /**< Total number of worker connections that were established to the manager. */
+	int workers_removed;      /**< Total number of worker connections that were released by the manager, idled-out, fast-aborted, or lost. */
+	int workers_released;     /**< Total number of worker connections that were asked by the manager to disconnect. */
 	int workers_idled_out;    /**< Total number of worker that disconnected for being idle. */
 	int workers_fast_aborted; /**< Total number of worker connections terminated for being too slow. (see @ref work_queue_activate_fast_abort) */
-	int workers_blacklisted ; /**< Total number of workers blacklisted by the master. (Includes workers_fast_aborted.) */
+	int workers_blocked ;     /**< Total number of workers blocked by the manager. (Includes workers_fast_aborted.) */
 	int workers_lost;         /**< Total number of worker connections that were unexpectedly lost. (does not include idled-out or fast-aborted) */
 
 	/* Stats for the current state of tasks: */
@@ -221,14 +248,14 @@ struct work_queue_stats {
 	/* A time_when_* refers to an instant in time, otherwise it refers to a length of time. */
 
 	/* Master time statistics: */
-	timestamp_t time_when_started; /**< Absolute time at which the master started. */
+	timestamp_t time_when_started; /**< Absolute time at which the manager started. */
 	timestamp_t time_send;         /**< Total time spent in sending tasks to workers (tasks descriptions, and input files.). */
 	timestamp_t time_receive;      /**< Total time spent in receiving results from workers (output files.). */
 	timestamp_t time_send_good;    /**< Total time spent in sending data to workers for tasks with result WQ_RESULT_SUCCESS. */
 	timestamp_t time_receive_good; /**< Total time spent in sending data to workers for tasks with result WQ_RESULT_SUCCESS. */
 	timestamp_t time_status_msgs;  /**< Total time spent sending and receiving status messages to and from workers, including workers' standard output, new workers connections, resources updates, etc. */
 	timestamp_t time_internal;     /**< Total time the queue spents in internal processing. */
-	timestamp_t time_polling;      /**< Total time blocking waiting for worker communications (i.e., master idle waiting for a worker message). */
+	timestamp_t time_polling;      /**< Total time blocking waiting for worker communications (i.e., manager idle waiting for a worker message). */
 	timestamp_t time_application;  /**< Total time spent outside work_queue_wait. */
 
 	/* Workers time statistics: */
@@ -237,17 +264,18 @@ struct work_queue_stats {
 	timestamp_t time_workers_execute_exhaustion; /**< Total time workers spent executing tasks that exhausted resources. */
 
 	/* BW statistics */
-	int64_t bytes_sent;     /**< Total number of file bytes (not including protocol control msg bytes) sent out to the workers by the master. */
-	int64_t bytes_received; /**< Total number of file bytes (not including protocol control msg bytes) received from the workers by the master. */
-	double  bandwidth;      /**< Average network bandwidth in MB/S observed by the master when transferring to workers. */
+	int64_t bytes_sent;     /**< Total number of file bytes (not including protocol control msg bytes) sent out to the workers by the manager. */
+	int64_t bytes_received; /**< Total number of file bytes (not including protocol control msg bytes) received from the workers by the manager. */
+	double  bandwidth;      /**< Average network bandwidth in MB/S observed by the manager when transferring to workers. */
 
 	/* resources statistics */
-	int capacity_tasks;     /**< The estimated number of tasks that this master can effectively support. */
-	int capacity_cores;     /**< The estimated number of workers' cores that this master can effectively support.*/
-	int capacity_memory;    /**< The estimated number of workers' MB of RAM that this master can effectively support.*/
-	int capacity_disk;      /**< The estimated number of workers' MB of disk that this master can effectively support.*/
-	int capacity_instantaneous;      /**< The estimated number of tasks that this master can support considering only the most recently completed task. */
-	int capacity_weighted;  /**< The estimated number of tasks that this master can support placing greater weight on the most recently completed task. */
+	int capacity_tasks;     /**< The estimated number of tasks that this manager can effectively support. */
+	int capacity_cores;     /**< The estimated number of workers' cores that this manager can effectively support.*/
+	int capacity_memory;    /**< The estimated number of workers' MB of RAM that this manager can effectively support.*/
+	int capacity_disk;      /**< The estimated number of workers' MB of disk that this manager can effectively support.*/
+	int capacity_gpus;      /**< The estimated number of workers' GPUs that this manager can effectively support.*/
+	int capacity_instantaneous;      /**< The estimated number of tasks that this manager can support considering only the most recently completed task. */
+	int capacity_weighted;  /**< The estimated number of tasks that this manager can support placing greater weight on the most recently completed task. */
 
 	int64_t total_cores;      /**< Total number of cores aggregated across the connected workers. */
 	int64_t total_memory;     /**< Total memory in MB aggregated across the connected workers. */
@@ -265,11 +293,11 @@ struct work_queue_stats {
 	int64_t min_memory;       /**< The smallest memory size in MB observed among the connected workers. */
 	int64_t min_disk;         /**< The smallest disk space in MB observed among the connected workers. */
 
-    double master_load;       /**< In the range of [0,1]. If close to 1, then
-                                the master is at full load and spends most
+    double manager_load;      /**< In the range of [0,1]. If close to 1, then
+                                the manager is at full load and spends most
                                 of its time sending and receiving taks, and
                                 thus cannot accept connections from new
-                                workers. If close to 0, the master is spending
+                                workers. If close to 0, the manager is spending
                                 most of its time waiting for something to happen. */
 
 	/**< deprecated fields: */
@@ -315,7 +343,12 @@ struct work_queue_stats {
 	int workers_full;               /**< @deprecated Use workers_busy insead. */
 	int total_worker_slots;         /**< @deprecated Use tasks_running instead. */
 	int avg_capacity;               /**< @deprecated Use capacity_cores instead. */
+	int workers_blacklisted;         /**< @deprecated Use workers_blocked instead. */
 };
+
+
+/* Forward declare the queue's structure. This structure is opaque and defined in work_queue.c */
+struct work_queue;
 
 
 /** @name Functions - Tasks */
@@ -355,8 +388,8 @@ void work_queue_task_specify_command( struct work_queue_task *t, const char *cmd
 - @ref WORK_QUEUE_CACHE indicates that the file should be cached for later tasks. (recommended)
 - @ref WORK_QUEUE_NOCACHE indicates that the file should not be cached for later tasks.
 - @ref WORK_QUEUE_WATCH indicates that the worker will watch the output file as it is created
-and incrementally return the file to the master as the task runs.  (The frequency of these updates
-is entirely dependent upon the system load.  If the master is busy interacting with many workers,
+and incrementally return the file to the manager as the task runs.  (The frequency of these updates
+is entirely dependent upon the system load.  If the manager is busy interacting with many workers,
 output updates will be infrequent.)
 @return 1 if the task file is successfully specified, 0 if either of @a t,  @a local_name, or @a remote_name is null or @a remote_name is an absolute path.
 */
@@ -388,7 +421,7 @@ int work_queue_task_specify_file_piece(struct work_queue_task *t, const char *lo
 - @ref WORK_QUEUE_NOCACHE indicates that the file should not be cached for later tasks.
 @return 1 if the task file is successfully specified, 0 if either of @a t or @a remote_name is null or @a remote_name is an absolute path.
 */
-int work_queue_task_specify_buffer(struct work_queue_task *t, const char *data, int length, const char *remote_name, work_queue_file_flags_t);
+int work_queue_task_specify_buffer(struct work_queue_task *t, const char *data, int length, const char *remote_name, work_queue_file_flags_t flags);
 
 /** Add a directory to a task.
 @param t A task object.
@@ -403,7 +436,21 @@ int work_queue_task_specify_buffer(struct work_queue_task *t, const char *data, 
 @param recursive indicates whether just the directory (0) or the directory and all of its contents (1) should be included.
 @return 1 if the task directory is successfully specified, 0 if either of @a t,  @a local_name, or @a remote_name is null or @a remote_name is an absolute path.
 */
-int work_queue_task_specify_directory(struct work_queue_task *t, const char *local_name, const char *remote_name, work_queue_file_type_t type, work_queue_file_flags_t, int recursive);
+int work_queue_task_specify_directory(struct work_queue_task *t, const char *local_name, const char *remote_name, work_queue_file_type_t type, work_queue_file_flags_t flags, int recursive);
+
+/** Gets/puts file at remote_name using cmd at worker.
+@param t A task object.
+@param remote_name The name of the file as seen by the task.
+@param cmd The shell command to transfer the file. For input files, it should read the contents from remote_name via stdin. For output files, it should write the contents to stdout.
+@param type Must be one of the following values:
+- @ref WORK_QUEUE_INPUT to indicate an input file to be consumed by the task
+- @ref WORK_QUEUE_OUTPUT to indicate an output file to be produced by the task
+@param flags	May be zero to indicate no special handling or any of @ref work_queue_file_flags_t or'd together. The most common are:
+- @ref WORK_QUEUE_CACHE indicates that the file should be cached for later tasks. (recommended)
+- @ref WORK_QUEUE_NOCACHE indicates that the file should not be cached for later tasks.
+@return 1 if the task file is successfully specified, 0 if either of @a t or @a remote_name is null or @a remote_name is an absolute path.
+*/
+int work_queue_task_specify_file_command(struct work_queue_task *t, const char *remote_name, const char *cmd, work_queue_file_type_t type, work_queue_file_flags_t flags);
 
 /** Specify the number of times this task is retried on worker errors. If less than one, the task is retried indefinitely (this the default). A task that did not succeed after the given number of retries is returned with result WORK_QUEUE_RESULT_MAX_RETRIES.
 @param t A task object.
@@ -414,7 +461,7 @@ void work_queue_task_specify_max_retries( struct work_queue_task *t, int64_t max
 
 /** Specify the amount of disk space required by a task.
 @param t A task object.
-@param disk The amount of disk space required by the task, in megabytes.
+@param memory The amount of disk space required by the task, in megabytes.
 */
 
 void work_queue_task_specify_memory( struct work_queue_task *t, int64_t memory );
@@ -444,7 +491,7 @@ void work_queue_task_specify_gpus( struct work_queue_task *t, int gpus );
  * Epoch). If less than 1, then no end time is specified (this is the default).
 This is useful, for example, when the task uses certificates that expire.
 @param t A task object.
-@param seconds Number of seconds since the Epoch.
+@param useconds Number of useconds since the Epoch.
 */
 
 void work_queue_task_specify_end_time( struct work_queue_task *t, int64_t useconds );
@@ -453,10 +500,27 @@ void work_queue_task_specify_end_time( struct work_queue_task *t, int64_t usecon
  * worker. This time is accounted since the the moment the task starts to run
  * in a worker.  If less than 1, then no maximum time is specified (this is the default).
 @param t A task object.
-@param seconds Maximum number of seconds the task may run in a worker.
+@param useconds Maximum number of seconds the task may run in a worker.
 */
 
 void work_queue_task_specify_running_time( struct work_queue_task *t, int64_t useconds );
+
+/** Specify the maximum time (in seconds) the task is allowed to run in a worker.
+ * This time is accounted since the moment the task starts to run in a worker.
+ * If less than 1, then no maximum time is specified (this is the default).
+ * Note: same effect as work_queue_task_specify_running_time.
+@param t A task object.
+@param seconds Maximum number of seconds the task may run in a worker.
+*/
+void work_queue_task_specify_running_time_max( struct work_queue_task *t, int64_t seconds );
+
+/** Specify the minimum time (in seconds) the task is expected to run in a worker.
+ * This time is accounted since the moment the task starts to run in a worker.
+ * If less than 1, then no minimum time is specified (this is the default).
+@param t A task object.
+@param seconds Minimum number of seconds the task may run in a worker.
+*/
+void work_queue_task_specify_running_time_min( struct work_queue_task *t, int64_t seconds );
 
 /** Attach a user defined string tag to the task.
 This field is not interpreted by the work queue, but is provided for the user's convenience
@@ -468,16 +532,14 @@ void work_queue_task_specify_tag(struct work_queue_task *t, const char *tag);
 
 /** Label the task with the given category. It is expected that tasks with the same category
 have similar resources requirements (e.g. for fast abort).
-@param q A work queue object.
 @param t A task object.
 @param category The name of the category to use.
 */
 void work_queue_task_specify_category(struct work_queue_task *t, const char *category);
 
 /** Label the task with a user-defined feature. The task will only run on a worker that provides (--feature option) such feature.
-@param q A work queue object.
 @param t A task object.
-@param feature The name of the feature.
+@param name The name of the feature.
 */
 void work_queue_task_specify_feature(struct work_queue_task *t, const char *name);
 
@@ -495,7 +557,7 @@ Specify an environment variable to be added to the task.
 @param name Name of the variable.
 @param value Value of the variable.
  */
-void work_queue_task_specify_enviroment_variable( struct work_queue_task *t, const char *name, const char *value );
+void work_queue_task_specify_environment_variable( struct work_queue_task *t, const char *name, const char *value );
 
 /** Select the scheduling algorithm for a single task.
 To change the scheduling algorithm for all tasks, use @ref work_queue_specify_algorithm instead.
@@ -584,7 +646,7 @@ Users may modify the behavior of @ref work_queue_create by setting the following
 - <b>WORK_QUEUE_LOW_PORT</b>: If the user requests a random port, then this sets the first port number in the scan range (if unset, the default is 1024).
 - <b>WORK_QUEUE_HIGH_PORT</b>: If the user requests a random port, then this sets the last port number in the scan range (if unset, the default is 32767).
 - <b>WORK_QUEUE_NAME</b>: This sets the project name of the queue, which is reported to a catalog server (by default this is unset).
-- <b>WORK_QUEUE_PRIORITY</b>: This sets the priority of the queue, which is used by workers to sort masters such that higher priority masters will be served first (if unset, the default is 10).
+- <b>WORK_QUEUE_PRIORITY</b>: This sets the priority of the queue, which is used by workers to sort managers such that higher priority managers will be served first (if unset, the default is 10).
 
 If the queue has a project name, then queue statistics and information will be
 reported to a catalog server.  To specify the catalog server, the user may set
@@ -602,11 +664,11 @@ summaries into a single. If monitor_output_dirname is NULL, work_queue_task is
 updated with the resources measured, and no summary file is kept unless
 explicitely given by work_queue_task's monitor_output_file.
 @param q A work queue object.
-@param monitor_output_dirname The name of the output directory. If NULL,
+@param monitor_output_directory The name of the output directory. If NULL,
 summaries are kept only when monitor_output_directory is specify per task, but
 resources_measured from work_queue_task is updated.  @return 1 on success, 0 if
 @param watchdog if not 0, kill tasks that exhaust declared resources.
-monitoring was not enabled.
+@return 1 on success, o if monitoring was not enabled.
 */
 int work_queue_enable_monitoring(struct work_queue *q, char *monitor_output_directory, int watchdog);
 
@@ -615,7 +677,7 @@ As @ref work_queue_enable_monitoring, but it generates a time series and a
 monitor debug file (WARNING: for long running tasks these files may reach
 gigabyte sizes. This function is mostly used for debugging.) @param q A work
 queue object.
-@param monitor_output_dirname The name of the output directory.
+@param monitor_output_directory The name of the output directory.
 @param watchdog if not 0, kill tasks that exhaust declared resources.
 @return 1 on success, 0 if monitoring was not enabled.
 */
@@ -635,7 +697,7 @@ int work_queue_submit(struct work_queue *q, struct work_queue_task *t);
 /** Set the minimum taskid of future submitted tasks.
 Further submitted tasks are guaranteed to have a taskid larger or equal to
 minid.  This function is useful to make taskids consistent in a workflow that
-consists of sequential masters. (Note: This function is rarely used).  If the
+consists of sequential managers. (Note: This function is rarely used).  If the
 minimum id provided is smaller than the last taskid computed, the minimum id
 provided is ignored.
 @param q A work queue object.
@@ -644,33 +706,32 @@ provided is ignored.
 */
 int work_queue_specify_min_taskid(struct work_queue *q, int minid);
 
-/** Blacklist hostname from a queue.
+/** Block workers in hostname from working for queue q.
 @param q A work queue object.
 @param hostname A string for hostname.
 */
-void work_queue_blacklist_add(struct work_queue *q, const char *hostname);
+void work_queue_block_host(struct work_queue *q, const char *hostname);
 
-/** Blacklist hostname from a queue. Remove from blacklist in timeout seconds.
-  If timeout is less than 1, then the hostname is blacklisted indefinitely, as
-  if @ref work_queue_blacklist_add was called instead.
+/** Block workers in hostname from a queue, but remove block after timeout seconds.
+  If timeout is less than 1, then the hostname is blocked indefinitely, as
+  if @ref work_queue_block_host was called instead.
   @param q A work queue object.
   @param hostname A string for hostname.
-  @param seconds Number of seconds to the hostname will be in the blacklist.
+  @param seconds Number of seconds to the hostname will be blocked.
   */
-void work_queue_blacklist_add_with_timeout(struct work_queue *q, const char *hostname, time_t seconds);
+void work_queue_block_host_with_timeout(struct work_queue *q, const char *hostname, time_t seconds);
 
 
-/** Unblacklist host from a queue.
+/** Unblock host from a queue.
 @param q A work queue object.
 @param hostname A string for hostname.
 */
-void work_queue_blacklist_remove(struct work_queue *q, const char *hostname);
+void work_queue_unblock_host(struct work_queue *q, const char *hostname);
 
-
-/** Clear blacklist of a queue.
+/** Unblock all host.
 @param q A work queue object.
 */
-void work_queue_blacklist_clear(struct work_queue *q);
+void work_queue_unblock_all(struct work_queue *q);
 
 /** Invalidate cached file.
 The file or directory with the given local name specification is deleted from
@@ -734,13 +795,13 @@ Rather than assuming a specific port, the user should simply call this function 
 */
 int work_queue_port(struct work_queue *q);
 
-/** Get queue statistics (only from master).
+/** Get queue statistics (only from manager).
 @param q A work queue object.
 @param s A pointer to a buffer that will be filed with statistics.
 */
 void work_queue_get_stats(struct work_queue *q, struct work_queue_stats *s);
 
-/** Get statistics of the master queue together with foremen information.
+/** Get statistics of the manager queue together with foremen information.
 @param q A work queue object.
 @param s A pointer to a buffer that will be filed with statistics.
 */
@@ -753,6 +814,12 @@ void work_queue_get_stats_hierarchy(struct work_queue *q, struct work_queue_stat
 */
 void work_queue_get_stats_category(struct work_queue *q, const char *c, struct work_queue_stats *s);
 
+
+/** Summary data for all workers in buffer.
+@param q A work queue object.
+@return A null terminated array of struct rmsummary. Each summary s indicates the number of s->workers with a certain number of s->cores, s->memory, and s->disk. The array and summaries need to be freed after use to avoid memory leaks.
+*/
+struct rmsummary **work_queue_workers_summary(struct work_queue *q);
 
 /** Get the current state of the task.
 @param q A work queue object.
@@ -769,12 +836,12 @@ void work_queue_set_bandwidth_limit(struct work_queue *q, const char *bandwidth)
 
 /** Get current queue bandwidth.
 @param q A work queue object.
-@return The average bandwidth in MB/s measured by the master.
+@return The average bandwidth in MB/s measured by the manager.
 */
 double work_queue_get_effective_bandwidth(struct work_queue *q);
 
 /** Summarize workers.
-This function summarizes the workers currently connected to the master,
+This function summarizes the workers currently connected to the manager,
 indicating how many from each worker pool are attached.
 @param q A work queue object.
 @return A newly allocated string describing the distribution of workers by pool.  The caller must release this string via free().
@@ -810,17 +877,18 @@ int work_queue_activate_fast_abort_category(struct work_queue *q, const char *ca
     If drain_flag is not 1, no new tasks are dispatched to workers at hostname,
     and if empty they are shutdown.
   @param q A work queue object.
+  @param hostname The hostname running the worker.
   @param drain_flag Draining mode.
   */
 int work_queue_specify_draining_by_hostname(struct work_queue *q, const char *hostname, int drain_flag);
 
-/** Turn on or off first-allocation labeling for a given category. By default, only cores, memory, and disk are labeled. Turn on/off other specific resources use @ref work_queue_specify_category_autolabel_resource.
+/** Turn on or off first-allocation labeling for a given category. By default, cores, memory, and disk are labeled, and gpus are unlabeled. Turn on/off other specific resources use @ref work_queue_enable_category_resource
 @param q A work queue object.
 @param category A category name.
-@param mode     One of @ref category_mode_t.
+@param mode     One of @ref work_queue_category_mode_t.
 @returns 1 if mode is valid, 0 otherwise.
 */
-int work_queue_specify_category_mode(struct work_queue *q, const char *category, category_mode_t mode);
+int work_queue_specify_category_mode(struct work_queue *q, const char *category, work_queue_category_mode_t mode);
 
 /** Turn on or off first-allocation labeling for a given category and resource. This function should be use to fine-tune the defaults from @ref work_queue_specify_category_mode.
 @param q A work queue object.
@@ -850,9 +918,21 @@ const char *work_queue_name(struct work_queue *q);
 */
 void work_queue_specify_name(struct work_queue *q, const char *name);
 
+/** Change the debug log path for a given queue (used by TLQ).
+@param q A work queue object.
+@param path The debug log path.
+*/
+void work_queue_specify_debug_path(struct work_queue *q, const char *path);
+
+/** Change the home host and port for a given queue (used by TLQ).
+@param q A work queue object.
+@param port New local port for the TLQ URL.
+*/
+void work_queue_specify_tlq_port(struct work_queue *q, int port);
+
 /** Change the priority for a given queue.
 @param q A work queue object.
-@param priority The new priority of the queue.  Higher priority masters will attract workers first.
+@param priority The new priority of the queue.  Higher priority managers will attract workers first.
 */
 void work_queue_specify_priority(struct work_queue *q, int priority);
 
@@ -866,14 +946,14 @@ void work_queue_specify_priority(struct work_queue *q, int priority);
   */
 void work_queue_specify_num_tasks_left(struct work_queue *q, int ntasks);
 
-/** Specify the catalog server the master should report to.
+/** Specify the catalog server the manager should report to.
 @param q A work queue object.
 @param hostname The catalog server's hostname.
 @param port The port the catalog server is listening on.
 */
 void work_queue_specify_catalog_server(struct work_queue *q, const char *hostname, int port);
 
-/** Specify the catalog server(s) the master should report to.
+/** Specify the catalog server(s) the manager should report to.
 @param q A work queue object.
 @param hosts The catalog servers given as a comma delimited list of hostnames or hostname:port
 */
@@ -895,7 +975,7 @@ struct work_queue_task *work_queue_cancel_by_tasktag(struct work_queue *q, const
 
 /** Cancel all submitted tasks and remove them from the queue.
 @param q A work queue object.
-@return A @ref list of all of the tasks submitted to q.  Each task must be deleted with @ref work_queue_task_delete or resubmitted with @ref work_queue_submit.
+@return A struct list of all of the tasks canceled.  Each task must be deleted with @ref work_queue_task_delete or resubmitted with @ref work_queue_submit.
 */
 struct list * work_queue_cancel_all_tasks(struct work_queue *q);
 
@@ -953,11 +1033,11 @@ void work_queue_specify_keepalive_interval(struct work_queue *q, int interval);
 void work_queue_specify_keepalive_timeout(struct work_queue *q, int timeout);
 
 /** Set the preference for using hostname over IP address to connect.
-'by_ip' uses IP address (standard behavior), or 'by_hostname' to use the hostname at the master.
+'by_ip' uses IP address (standard behavior), or 'by_hostname' to use the hostname at the manager.
 @param q A work queue object.
 @param preferred_connection An string to indicate using 'by_ip' or a 'by_hostname'.
 */
-void work_queue_master_preferred_connection(struct work_queue *q, const char *preferred_connection);
+void work_queue_manager_preferred_connection(struct work_queue *q, const char *preferred_connection);
 
 /** Tune advanced parameters for work queue.
 @param q A work queue object.
@@ -982,31 +1062,51 @@ int work_queue_tune(struct work_queue *q, const char *name, double value);
 /** Sets the maximum resources a task without an explicit category ("default" category).
 rm specifies the maximum resources a task in the default category may use.
 @param q  Reference to the current work queue object.
-@param rm Structure indicating maximum values. See @rmsummary for possible fields.
+@param rm Structure indicating maximum values. See @ref rmsummary for possible fields.
 */
 void work_queue_specify_max_resources(struct work_queue *q,  const struct rmsummary *rm);
+
+/** Sets the minimum resources a task without an explicit category ("default" category).
+rm specifies the maximum resources a task in the default category may use.
+@param q  Reference to the current work queue object.
+@param rm Structure indicating maximum values. See @ref rmsummary for possible fields.
+*/
+void work_queue_specify_min_resources(struct work_queue *q,  const struct rmsummary *rm);
 
 /** Sets the maximum resources a task in the category may use.
 @param q         Reference to the current work queue object.
 @param category  Name of the category.
-@param rm Structure indicating maximum values. See @rmsummary for possible fields.
+@param rm Structure indicating minimum values. See @ref rmsummary for possible fields.
 */
 void work_queue_specify_category_max_resources(struct work_queue *q,  const char *category, const struct rmsummary *rm);
+
+/** Sets the minimum resources a task in the category may use.
+@param q         Reference to the current work queue object.
+@param category  Name of the category.
+@param rm Structure indicating minimum values. See @ref rmsummary for possible fields.
+*/
+void work_queue_specify_category_min_resources(struct work_queue *q,  const char *category, const struct rmsummary *rm);
 
 /** Set the initial guess for resource autolabeling for the given category.
 @param q         Reference to the current work queue object.
 @param category  Name of the category.
-@param rm Structure indicating maximum values. See @rmsummary for possible fields.
+@param rm Structure indicating maximum values. Autolabeling available for cores, memory, disk, and gpus
 */
 void work_queue_specify_category_first_allocation_guess(struct work_queue *q,  const char *category, const struct rmsummary *rm);
 
 /** Initialize first value of categories
 @param q     Reference to the current work queue object.
-@param rm Structure indicating maximum overall values. See @rmsummary for possible fields.
-@param filename JSON file with resource summaries.
+@param max Structure indicating maximum values. Autolabeling available for cores, memory, disk, and gpus
+@param summaries_file JSON file with resource summaries.
 */
 void work_queue_initialize_categories(struct work_queue *q, struct rmsummary *max, const char *summaries_file);
 
+
+/** Explain result codes from tasks.
+@param result Result from a task returned by @ref work_queue_wait.
+@return String representation of task result code.
+*/
+const char *work_queue_result_str(work_queue_result_t result);
 
 //@}
 
@@ -1026,22 +1126,22 @@ void work_queue_initialize_categories(struct work_queue *q, struct rmsummary *ma
 void work_queue_specify_task_order(struct work_queue *q, int order);
 
 
-#define WORK_QUEUE_MASTER_MODE_STANDALONE 0 /**< Work Queue master does not report to the catalog server. */
-#define WORK_QUEUE_MASTER_MODE_CATALOG 1    /**< Work Queue master reports to catalog server. */
+#define WORK_QUEUE_MANAGER_MODE_STANDALONE 0 /**< Work Queue manager does not report to the catalog server. */
+#define WORK_QUEUE_MANAGER_MODE_CATALOG 1    /**< Work Queue manager reports to catalog server. */
 
-/** Specify the master mode for a given queue.
+/** Specify the manager mode for a given queue.
 @param q A work queue object.
 @param mode
-- @ref WORK_QUEUE_MASTER_MODE_STANDALONE - standalone mode. In this mode the master would not report its information to a catalog server;
-- @ref WORK_QUEUE_MASTER_MODE_CATALOG - catalog mode. In this mode the master report itself to a catalog server where workers get masters' information and select a master to serve.
+- @ref WORK_QUEUE_MANAGER_MODE_STANDALONE - standalone mode. In this mode the manager would not report its information to a catalog server;
+- @ref WORK_QUEUE_MANAGER_MODE_CATALOG - catalog mode. In this mode the manager report itself to a catalog server where workers get managers' information and select a manager to serve.
 @deprecated Enabled automatically when @ref work_queue_specify_name is used.
 */
-void work_queue_specify_master_mode(struct work_queue *q, int mode);
+void work_queue_specify_manager_mode(struct work_queue *q, int mode);
 
 
-/** Change whether to estimate master capacity for a given queue.
+/** Change whether to estimate manager capacity for a given queue.
 @param q A work queue object.
-@param estimate_capacity_on if the value of this parameter is 1, then work queue should estimate the master capacity. If the value is 0, then work queue would not estimate its master capacity.
+@param estimate_capacity_on if the value of this parameter is 1, then work queue should estimate the manager capacity. If the value is 0, then work queue would not estimate its manager capacity.
 @deprecated This feature is always enabled.
 */
 void work_queue_specify_estimate_capacity_on(struct work_queue *q, int estimate_capacity_on);
@@ -1093,11 +1193,25 @@ int work_queue_task_specify_output_file(struct work_queue_task *t, const char *r
 int work_queue_task_specify_output_file_do_not_cache(struct work_queue_task *t, const char *rname, const char *fname);
 
 /** Generate a worker-level unique filename to indicate a disk allocation being full.
- @param p The process for which we generate a unique disk allocation filename.
+ @param pwd Base pathname.
+ @param taskid id of the task to generate the filename.
  @return The string corresponding to the filename.
 */
 char *work_queue_generate_disk_alloc_full_filename(char *pwd, int taskid);
 
+
+/** Same as work_queue_task_specify_environment_variable, but with a typo in environment
+ */
+void work_queue_task_specify_enviroment_variable( struct work_queue_task *t, const char *name, const char *value );
+
 //@}
+
+// Renames for backwards compatibility
+#define work_queue_master_preferred_connection work_queue_manager_preferred_connection
+#define work_queue_specify_master_mode         work_queue_specify_manager_mode
+#define work_queue_blacklist_add               work_queue_block_host
+#define work_queue_blacklist_add_with_timeout  work_queue_block_host_with_timeout
+#define work_queue_blacklist_remove            work_queue_unblock_host
+#define work_queue_blacklist_clear             work_queue_unblock_all
 
 #endif

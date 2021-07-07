@@ -66,8 +66,21 @@ void buffer_free(buffer_t * b)
 	}
 }
 
-/* make room for at least n chars */
-static int grow(buffer_t * b, size_t n)
+int buffer_seek(buffer_t * b, size_t pos) {
+	assert(b);
+
+	if (pos >= inuse(b)) {
+		int rc = buffer_grow(b, pos - inuse(b) + 1);
+		if (rc < 0) return rc;
+		b->end = b->buf + pos;
+		b->end[0] = '\0';
+	} else {
+		buffer_rewind(b, pos);
+	}
+	return 0;
+}
+
+int buffer_grow(buffer_t * b, size_t n)
 {
 	size_t used = inuse(b);
 	size_t newlen = sizeof(b->initial); /* current buf is always at least as big as b->initial */
@@ -85,6 +98,9 @@ static int grow(buffer_t * b, size_t n)
 			checkerror(b, 0, 0);
 		}
 	}
+
+	/* Keep using the initial buffer if possible */
+	if (newlen <= b->len) return 0;
 
 	if (b->buf == b->ubuf.buf || b->buf == b->initial) {
 		char *new = malloc(newlen);
@@ -116,7 +132,7 @@ int buffer_putvfstring(buffer_t * b, const char *format, va_list va)
 	checkerror(b, -1, rc);
 	/* N.B. vsnprintf rc does not include NUL byte */
 	if (avail(b) <= (size_t)rc) {
-		rc = grow(b, rc+1);
+		rc = buffer_grow(b, rc+1);
 		if (rc == -1) return -1;
 	} else {
 		b->end += rc;
@@ -147,7 +163,7 @@ int buffer_putfstring(buffer_t * b, const char *format, ...)
 
 int buffer_putlstring(buffer_t * b, const char *str, size_t len)
 {
-	if (avail(b) <= len && grow(b, len+1) == -1) {
+	if (avail(b) <= len && buffer_grow(b, len+1) == -1) {
 		return -1;
 	}
 	memcpy(b->end, str, len);
